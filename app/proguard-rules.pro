@@ -1,0 +1,2 @@
+-keep class com.polish.twitter.MainHook { *; }
+-keep class org.luckypray.dexkit.** { *; }
