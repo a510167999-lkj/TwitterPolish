@@ -7,6 +7,9 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.view.SurfaceView
+import android.view.TextureView
+import android.view.View
 import android.widget.Toast
 import com.polish.twitter.core.Logger
 import com.polish.twitter.utils.Downloader
@@ -99,6 +102,7 @@ class MediaDownloadHook : BaseHook() {
             hookActivityLifecycle()
             hookOkHttpVideoRequests(classLoader)
             hookExoPlayer(classLoader)
+            hookVideoPlayerLongPress(classLoader)
             hookClipboard()
         } catch (e: Throwable) {
             Logger.e("Failed to initialize MediaDownloadHook", e)
@@ -164,16 +168,29 @@ class MediaDownloadHook : BaseHook() {
     }
 
     private fun captureVideoUrlFromRequest(urlStr: String) {
-        // 仅捕获 video.twimg.com 上的 MP4 文件（排除 HLS m3u8 manifest）
-        if ((urlStr.contains("video.twimg.com") || urlStr.contains("ext_tw_video")) &&
-            urlStr.contains(".mp4") && !urlStr.contains(".m3u8")) {
-            // 取分辨率最高的：X 通常 URL 里含有 1280x720 或 2048x1152
+        // 仅捕获 video.twimg.com 上的视频 MP4（排除 HLS manifest 和纯音频轨道）
+        if ((urlStr.contains("video.twimg.com") || urlStr.contains("ext_tw_video") || urlStr.contains("amplify_video")) &&
+            urlStr.contains(".mp4") && !urlStr.contains(".m3u8") && isVideoMp4Url(urlStr)) {
             val current = latestVideoUrl
             if (current == null || isBetterVideoUrl(urlStr, current)) {
                 latestVideoUrl = urlStr
-                Logger.d("OkHttp captured video.twimg.com MP4: $urlStr")
+                Logger.d("OkHttp captured video MP4: $urlStr")
             }
         }
+    }
+
+    /** 是否为有效的视频 MP4（排除纯音频轨道） */
+    private fun isVideoMp4Url(urlStr: String): Boolean {
+        // 音频专用路径特征：/aud/ 或 /mp4a/
+        if (urlStr.contains("/aud/") || urlStr.contains("/mp4a/")) return false
+        // 排除分辨率为 0x0 的 URL
+        val res = Regex("""(\d+)x(\d+)""").find(urlStr)
+        if (res != null) {
+            val w = res.groupValues[1].toIntOrNull() ?: 0
+            val h = res.groupValues[2].toIntOrNull() ?: 0
+            if (w == 0 && h == 0) return false
+        }
+        return true
     }
 
     /** 比较两个 video.twimg.com URL，返回分辨率更高的那个是否为 candidate */
@@ -238,6 +255,119 @@ class MediaDownloadHook : BaseHook() {
                 }
             }
         } catch (_: Throwable) {}
+    }
+
+    // ----------- 策略3：视频播放器界面长按下载 ----------- //
+
+    /**
+     * 通过两条路径让用户长按视频画面触发下载：
+     *
+     * 路径 A：Hook View.onAttachedToWindow()
+     *   - SurfaceView / TextureView 是 ExoPlayer 的渲染目标
+     *   - 每当这类 View 被添加到窗口时，自动为其设置 OnLongClickListener
+     *
+     * 路径 B：Hook Activity.onWindowFocusChanged()
+     *   - 切换到视频全屏时，遍历当前 DecorView 树，为所有 SurfaceView / TextureView 设置长按
+     */
+    private fun hookVideoPlayerLongPress(classLoader: ClassLoader) {
+        // --- 路径 A: 监听 SurfaceView / TextureView attach ---
+        val longClickHook = object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                val view = param.thisObject as? View ?: return
+                val act = currentActivity ?: return
+                // 只处理视频相关的 View
+                val isVideoView = view is SurfaceView || view is TextureView ||
+                        view.javaClass.name.contains("Player", ignoreCase = true) ||
+                        view.javaClass.name.contains("Video", ignoreCase = true) ||
+                        view.javaClass.name.contains("Surface", ignoreCase = true) ||
+                        view.javaClass.name.contains("Texture", ignoreCase = true)
+                if (!isVideoView) return
+                if (view.isLongClickable) return   // 已设置过，跳过
+                view.isLongClickable = true
+                view.setOnLongClickListener {
+                    mainHandler.post { showDownloadDialogFromView(act) }
+                    true
+                }
+                Logger.d("Attached long-press download to: ${view.javaClass.simpleName}")
+            }
+        }
+        try {
+            XposedBridge.hookAllMethods(View::class.java, "onAttachedToWindow", longClickHook)
+            Logger.i("Hooked View.onAttachedToWindow for video long-press download")
+        } catch (e: Throwable) {
+            Logger.w("View.onAttachedToWindow hook failed: ${e.message}")
+        }
+
+        // --- 路径 B: Activity.onWindowFocusChanged 后扫描 DecorView ---
+        try {
+            XposedHelpers.findAndHookMethod(
+                Activity::class.java, "onWindowFocusChanged", Boolean::class.java,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val act = param.thisObject as? Activity ?: return
+                        val hasFocus = param.args[0] as? Boolean ?: return
+                        if (!hasFocus) return
+                        currentActivity = act
+                        mainHandler.postDelayed({
+                            try {
+                                attachLongPressToVideoViews(act)
+                            } catch (_: Throwable) {}
+                        }, 400)
+                    }
+                }
+            )
+            Logger.i("Hooked Activity.onWindowFocusChanged for video long-press scan")
+        } catch (e: Throwable) {
+            Logger.w("onWindowFocusChanged hook failed: ${e.message}")
+        }
+    }
+
+    /** 递归遍历 View 树，为所有 SurfaceView / TextureView 设置长按下载 */
+    private fun attachLongPressToVideoViews(activity: Activity) {
+        val decor = activity.window?.decorView ?: return
+        val videoViews = mutableListOf<View>()
+        fun scanView(v: View) {
+            if (v is SurfaceView || v is TextureView ||
+                v.javaClass.name.contains("PlayerView", ignoreCase = true) ||
+                v.javaClass.name.contains("VideoView", ignoreCase = true)) {
+                videoViews.add(v)
+            }
+            if (v is android.view.ViewGroup) {
+                for (i in 0 until v.childCount) scanView(v.getChildAt(i))
+            }
+        }
+        scanView(decor)
+        for (v in videoViews) {
+            if (!v.isLongClickable) {
+                v.isLongClickable = true
+                v.setOnLongClickListener {
+                    showDownloadDialogFromView(activity)
+                    true
+                }
+                Logger.d("Window scan: attached long-press to ${v.javaClass.simpleName}")
+            }
+        }
+    }
+
+    /**
+     * 从视频播放器界面发起的下载对话框（立即弹出，无需复制链接）
+     */
+    private fun showDownloadDialogFromView(activity: Activity) {
+        if (activity.isFinishing) return
+        val videoUrl = latestVideoUrl ?: graphqlVideoUrl
+        if (videoUrl.isNullOrBlank()) {
+            Toast.makeText(activity, "⚠️ 未捕获到视频链接，请稍等视频缓冲后再长按", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val fileName = "TwitterPolish_${System.currentTimeMillis()}.mp4"
+        AlertDialog.Builder(activity)
+            .setTitle("📥 下载当前视频")
+            .setMessage("已捕获视频流：\n${videoUrl.take(80)}...\n\n点击【立即下载】保存到相册。")
+            .setPositiveButton("立即下载") { _, _ ->
+                Downloader.download(activity, videoUrl, fileName, true)
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     // ----------- 剪贴板：用户复制推文链接时弹出下载对话框 ----------- //
