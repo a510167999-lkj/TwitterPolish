@@ -18,6 +18,7 @@ import com.polish.twitter.core.Constants
 import com.polish.twitter.core.Logger
 import com.polish.twitter.processor.MediaCache
 import com.polish.twitter.utils.Downloader
+import com.polish.twitter.utils.ExoCacheProbe
 
 object SettingsDialog {
 
@@ -74,11 +75,13 @@ object SettingsDialog {
             val btnQuickDownload = Button(activity).apply {
                 text = "📥 下载当前媒体 / 查看下载说明"
                 setOnClickListener {
-                    val media = MediaCache.resolve()
+                    val media = MediaCache.resolve().ifEmpty {
+                        listOfNotNull(ExoCacheProbe.findCurrentHls(activity, MediaCache.currentMediaId))
+                    }
                     if (media.isNotEmpty()) {
                         Downloader.download(activity, media.first())
                     } else {
-                        Toast.makeText(activity, "💡 先打开带视频的推文，或分享→复制链接，再点下载。播放器画面长按也可。", Toast.LENGTH_LONG).show()
+                        Toast.makeText(activity, "💡 先播放视频几秒，再长按画面或点这里。会从 HLS 流合成完整 MP4。", Toast.LENGTH_LONG).show()
                     }
                 }
             }

@@ -19,6 +19,7 @@ import com.polish.twitter.processor.ExtractedMedia
 import com.polish.twitter.processor.MediaCache
 import com.polish.twitter.processor.MediaExtractor
 import com.polish.twitter.utils.Downloader
+import com.polish.twitter.utils.ExoCacheProbe
 import com.polish.twitter.utils.HostOkHttp
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
@@ -58,6 +59,7 @@ class MediaDownloadHook : BaseHook() {
             hookActivityLifecycle()
             hookOkHttpVideoRequests(classLoader)
             hookExoPlayer(classLoader)
+            hookMedia3DataSource(classLoader)
             hookPlayerLongPress()
             hookClipboard()
         } catch (e: Throwable) {
@@ -133,6 +135,48 @@ class MediaDownloadHook : BaseHook() {
             urlStr.contains("amplify_video")
         ) {
             MediaCache.notePlaybackUrl(urlStr)
+            if (MediaExtractor.isHlsPlaylistUrl(urlStr)) {
+                val mediaId = MediaExtractor.extractMediaId(urlStr) ?: return
+                MediaCache.ingestObject(
+                    org.json.JSONObject().put(
+                        "video_info",
+                        org.json.JSONObject().put(
+                            "variants",
+                            org.json.JSONArray().put(
+                                org.json.JSONObject()
+                                    .put("content_type", "application/x-mpegURL")
+                                    .put("url", urlStr)
+                            )
+                        )
+                    ).put("id_str", mediaId).put("rest_id", mediaId).put("__typename", "Tweet")
+                )
+            }
+        }
+    }
+
+    private fun hookMedia3DataSource(classLoader: ClassLoader) {
+        val names = listOf(
+            "androidx.media3.datasource.DefaultHttpDataSource",
+            "androidx.media3.datasource.cronet.CronetDataSource",
+            "com.google.android.exoplayer2.upstream.DefaultHttpDataSource"
+        )
+        for (name in names) {
+            try {
+                val clazz = classLoader.loadClass(name)
+                XposedBridge.hookAllMethods(clazz, "open", object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val spec = param.args.getOrNull(0) ?: return
+                        val uri = try {
+                            XposedHelpers.getObjectField(spec, "uri")
+                        } catch (_: Throwable) {
+                            try { XposedHelpers.callMethod(spec, "getUri") } catch (_: Throwable) { null }
+                        } ?: return
+                        notePlaybackIfVideo(uri.toString())
+                    }
+                })
+                Logger.i("Hooked $name.open for HLS URL capture")
+            } catch (_: Throwable) {
+            }
         }
     }
 
@@ -327,11 +371,17 @@ class MediaDownloadHook : BaseHook() {
 
     private fun showDownloadChooser(activity: Activity, tweetId: String? = null) {
         if (activity.isFinishing) return
-        val items = MediaCache.resolve(tweetId)
+        var items = MediaCache.resolve(tweetId)
+        if (items.none { it.isVideo }) {
+            val hls = ExoCacheProbe.findCurrentHls(activity, MediaCache.currentMediaId)
+            if (hls != null) {
+                items = listOf(hls) + items.filter { !it.isVideo }
+            }
+        }
         if (items.isEmpty()) {
             AlertDialog.Builder(activity)
                 .setTitle("📥 下载推文媒体")
-                .setMessage("还没有这条推文的完整视频直链。\n\n请先打开该推文等画面开始播放，或复制这条推文的链接后再试。\n（播放器内部的是 DASH 分片，不能直接保存。）")
+                .setMessage("还没拿到这条视频的播放列表。\n请先让视频播放几秒再长按，模块会从 HLS 流合成完整 MP4。")
                 .setPositiveButton("知道了", null)
                 .show()
             return
@@ -343,8 +393,11 @@ class MediaDownloadHook : BaseHook() {
 
         val labels = items.map { media ->
             if (media.isVideo) {
-                val kbps = if (media.bitrate > 0) " ${media.bitrate / 1000}kbps" else ""
-                "📥 视频$kbps"
+                if (MediaExtractor.isHlsPlaylistUrl(media.url)) "📥 合成下载当前视频（HLS）"
+                else {
+                    val kbps = if (media.bitrate > 0) " ${media.bitrate / 1000}kbps" else ""
+                    "📥 视频$kbps"
+                }
             } else {
                 "🖼️ 原图"
             }
@@ -361,9 +414,12 @@ class MediaDownloadHook : BaseHook() {
 
     private fun confirmDownload(activity: Activity, media: ExtractedMedia) {
         val kind = if (media.isVideo) "视频" else "原图"
+        val extra = if (media.isVideo && MediaExtractor.isHlsPlaylistUrl(media.url)) {
+            "\n将从播放器 HLS 流合成完整 MP4（含音轨）。"
+        } else ""
         AlertDialog.Builder(activity)
             .setTitle("📥 下载$kind")
-            .setMessage("将保存到 ${if (media.isVideo) "Movies" else "Pictures"}/Twitter/\n${media.fileName}")
+            .setMessage("将保存到 ${if (media.isVideo) "Movies" else "Pictures"}/Twitter/\n${media.fileName}$extra")
             .setPositiveButton("立即下载") { _, _ ->
                 Downloader.download(activity, media)
             }

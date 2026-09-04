@@ -111,7 +111,9 @@ object MediaCache {
 
     private fun put(media: ExtractedMedia) {
         if (media.url.isBlank()) return
-        if (media.isVideo && MediaExtractor.isDashSegmentUrl(media.url)) return
+        if (media.isVideo && MediaExtractor.isDashSegmentUrl(media.url) &&
+            !MediaExtractor.isHlsPlaylistUrl(media.url)
+        ) return
 
         if (media.mediaId.isNotBlank()) {
             val existing = byMediaId[media.mediaId]
@@ -136,6 +138,10 @@ object MediaCache {
 
     private fun prefer(candidate: ExtractedMedia, current: ExtractedMedia): Boolean {
         if (candidate.isVideo && current.isVideo) {
+            val cHls = MediaExtractor.isHlsPlaylistUrl(candidate.url)
+            val curHls = MediaExtractor.isHlsPlaylistUrl(current.url)
+            if (!cHls && curHls) return true
+            if (cHls && !curHls) return false
             return candidate.bitrate >= current.bitrate
         }
         return false

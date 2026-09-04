@@ -12,7 +12,8 @@ data class ExtractedMedia(
     val width: Int = 0,
     val height: Int = 0,
     val tweetId: String = "",
-    val mediaId: String = ""
+    val mediaId: String = "",
+    val hlsAudioUrl: String = ""
 )
 
 object MediaExtractor {
@@ -27,15 +28,20 @@ object MediaExtractor {
      */
     fun isDashSegmentUrl(url: String): Boolean {
         if (url.isBlank()) return false
+        if (isHlsPlaylistUrl(url)) return false
         val u = url.lowercase()
         return u.contains("/0/0/") ||
             u.contains("/aud/") ||
             u.contains("/mp4a/") ||
-            u.contains(".m3u8")
+            u.contains(".m4s")
+    }
+
+    fun isHlsPlaylistUrl(url: String): Boolean {
+        return url.contains(".m3u8", ignoreCase = true)
     }
 
     fun isProgressiveMp4Url(url: String): Boolean {
-        return url.contains(".mp4", ignoreCase = true) && !isDashSegmentUrl(url)
+        return url.contains(".mp4", ignoreCase = true) && !isDashSegmentUrl(url) && !isHlsPlaylistUrl(url)
     }
 
     /**
@@ -209,14 +215,18 @@ object MediaExtractor {
         }
 
         val videoInfo = obj.optJSONObject("video_info")
+            ?: obj.optJSONObject("videoInfo")
+            ?: obj.optJSONObject("media_info")
+            ?: obj.optJSONObject("mediaInfo")
         if (videoInfo != null) {
-            pickBestProgressiveMp4(videoInfo)?.let { picked ->
+            val picked = pickBestProgressiveMp4(videoInfo) ?: pickBestHls(videoInfo)
+            picked?.let {
                 val mediaId = obj.optString("id_str").ifBlank {
-                    extractMediaId(picked.url) ?: tweetId
+                    extractMediaId(it.url) ?: tweetId
                 }
                 val baseId = tweetId.ifBlank { mediaId }
                 out.add(
-                    picked.copy(
+                    it.copy(
                         tweetId = tweetId,
                         mediaId = mediaId,
                         fileName = "twitter_${baseId}_video.mp4"
@@ -278,10 +288,12 @@ object MediaExtractor {
         var maxBitrate = -1L
         for (i in 0 until variants.length()) {
             val variant = variants.optJSONObject(i) ?: continue
-            val contentType = variant.optString("content_type")
+            val contentType = variant.optString("content_type").ifBlank {
+                variant.optString("contentType")
+            }
             val bitrate = variant.optLong("bitrate", 0L)
             val videoUrl = variant.optString("url")
-            if (contentType == "video/mp4" && isProgressiveMp4Url(videoUrl)) {
+            if (contentType.contains("mp4") && isProgressiveMp4Url(videoUrl)) {
                 if (bitrate > maxBitrate || bestUrl == null) {
                     maxBitrate = bitrate
                     bestUrl = videoUrl
@@ -294,6 +306,31 @@ object MediaExtractor {
             isVideo = true,
             fileName = "twitter_video.mp4",
             bitrate = maxBitrate
+        )
+    }
+
+    internal fun pickBestHls(videoInfo: JSONObject): ExtractedMedia? {
+        val variants = videoInfo.optJSONArray("variants") ?: return null
+        var bestUrl: String? = null
+        for (i in 0 until variants.length()) {
+            val variant = variants.optJSONObject(i) ?: continue
+            val contentType = variant.optString("content_type").ifBlank {
+                variant.optString("contentType")
+            }
+            val videoUrl = variant.optString("url")
+            if ((contentType.contains("mpegURL", ignoreCase = true) || isHlsPlaylistUrl(videoUrl)) &&
+                isHlsPlaylistUrl(videoUrl)
+            ) {
+                if (bestUrl == null || videoUrl.contains("/pl/")) {
+                    bestUrl = videoUrl
+                }
+            }
+        }
+        val url = bestUrl ?: return null
+        return ExtractedMedia(
+            url = url,
+            isVideo = true,
+            fileName = "twitter_video.mp4"
         )
     }
 }

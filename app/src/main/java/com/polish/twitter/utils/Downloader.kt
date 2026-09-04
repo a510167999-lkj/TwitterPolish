@@ -37,18 +37,32 @@ object Downloader {
     private const val MIN_VIDEO_BYTES = 50_000L
 
     fun download(context: Context, media: ExtractedMedia) {
-        download(context, media.url, media.fileName, media.isVideo)
+        download(context, media.url, media.fileName, media.isVideo, media.hlsAudioUrl)
     }
 
-    fun download(context: Context, downloadUrl: String, fileName: String, isVideo: Boolean) {
+    fun download(
+        context: Context,
+        downloadUrl: String,
+        fileName: String,
+        isVideo: Boolean,
+        hlsAudioUrl: String = ""
+    ) {
         val cleanUrl = downloadUrl.trim()
         if (cleanUrl.isBlank()) {
             showToast(context, "❌ 下载链接无效")
             return
         }
+        if (MediaExtractor.isHlsPlaylistUrl(cleanUrl)) {
+            showToast(context, "📥 正在从播放流合成完整视频…")
+            Logger.i("HLS download requested: $cleanUrl audio=$hlsAudioUrl")
+            executor.execute {
+                performHlsDownload(context.applicationContext, cleanUrl, hlsAudioUrl, fileName)
+            }
+            return
+        }
         if (isVideo && MediaExtractor.isDashSegmentUrl(cleanUrl)) {
             Logger.w("Refusing DASH segment URL: $cleanUrl")
-            showToast(context, "❌ 这是播放器分片，不是完整视频。请打开推文或复制链接后再试")
+            showToast(context, "❌ 这是播放器分片。请等视频开播后再长按，将改为合成完整视频")
             return
         }
 
@@ -230,6 +244,97 @@ object Downloader {
         } finally {
             opened?.close?.invoke()
             connection?.disconnect()
+        }
+    }
+
+    private fun performHlsDownload(context: Context, playlistUrl: String, audioUrl: String, fileName: String) {
+        val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        val notificationId = notificationIdCounter.incrementAndGet()
+        ensureNotificationChannel(notificationManager)
+        val notificationBuilder = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setContentTitle("正在合成 Twitter 视频")
+            .setContentText("连接播放列表…")
+            .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setProgress(100, 0, true)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+        tryNotify(notificationManager, notificationId, notificationBuilder.build())
+
+        val workDir = File(context.cacheDir, "tp_hls_${System.currentTimeMillis()}")
+        val muxed = File(workDir, fileName)
+        var outputUri: Uri? = null
+        var outputStream: java.io.OutputStream? = null
+        try {
+            HlsDownloader.downloadToFile(
+                playlistUrl = playlistUrl,
+                audioPlaylistUrl = audioUrl,
+                output = muxed,
+                workDir = workDir
+            ) { msg ->
+                notificationBuilder.setContentText(msg)
+                tryNotify(notificationManager, notificationId, notificationBuilder.build())
+            }
+
+            val values = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/Twitter")
+                put(MediaStore.Video.Media.IS_PENDING, 1)
+            }
+            outputUri = context.contentResolver.insert(
+                MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+                values
+            ) ?: throw RuntimeException("MediaStore 无法创建文件")
+            outputStream = context.contentResolver.openOutputStream(outputUri)
+                ?: throw RuntimeException("无法打开输出流")
+            HlsDownloader.copyFileTo(muxed, outputStream)
+            outputStream.close()
+            outputStream = null
+            context.contentResolver.update(
+                outputUri,
+                ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) },
+                null,
+                null
+            )
+
+            val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(outputUri, "video/*")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT or
+                    (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0)
+            val pi = PendingIntent.getActivity(context, notificationId, viewIntent, pendingFlags)
+            tryNotify(
+                notificationManager,
+                notificationId,
+                NotificationCompat.Builder(context, CHANNEL_ID)
+                    .setContentTitle("✅ Twitter 视频已保存")
+                    .setContentText("Movies/Twitter/$fileName（${muxed.length() / 1024} KB）")
+                    .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                    .setContentIntent(pi)
+                    .setAutoCancel(true)
+                    .build()
+            )
+            showToast(context, "✅ 下载完成（${muxed.length() / 1024} KB）")
+        } catch (e: Throwable) {
+            Logger.e("HLS download failed: ${e.message}", e)
+            if (outputUri != null) {
+                try { context.contentResolver.delete(outputUri, null, null) } catch (_: Throwable) {}
+            }
+            tryNotify(
+                notificationManager,
+                notificationId,
+                NotificationCompat.Builder(context, CHANNEL_ID)
+                    .setContentTitle("❌ 下载失败")
+                    .setContentText(e.localizedMessage ?: "合成失败")
+                    .setSmallIcon(android.R.drawable.stat_notify_error)
+                    .setAutoCancel(true)
+                    .build()
+            )
+            showToast(context, "❌ 下载失败: ${e.localizedMessage}")
+        } finally {
+            outputStream?.runCatching { close() }
+            workDir.deleteRecursively()
         }
     }
 

@@ -17,6 +17,7 @@ import com.polish.twitter.core.Constants
 import com.polish.twitter.core.Logger
 import com.polish.twitter.processor.MediaCache
 import com.polish.twitter.utils.Downloader
+import com.polish.twitter.utils.ExoCacheProbe
 
 object FloatingMenuManager {
 
@@ -134,7 +135,12 @@ object FloatingMenuManager {
         val options = mutableListOf<String>()
         val actions = mutableListOf<() -> Unit>()
 
-        val mediaItems = MediaCache.resolve()
+        val mediaItems = MediaCache.resolve().toMutableList()
+        if (mediaItems.none { it.isVideo }) {
+            ExoCacheProbe.findCurrentHls(activity, MediaCache.currentMediaId)?.let {
+                mediaItems.add(0, it)
+            }
+        }
         val videos = mediaItems.filter { it.isVideo }
         val photos = mediaItems.filter { !it.isVideo }
 

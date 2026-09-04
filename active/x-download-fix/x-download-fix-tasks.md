@@ -9,3 +9,4 @@
 - [x] 悬浮球 / 设置改读 `MediaCache`
 - [x] 单测（DASH 拒绝、按 ID 解析、ftyp）
 - [x] `assembleDebug` + 真机安装 + force-stop X
+- [x] HLS 合成：ExoPlayer 缓存取 m3u8，下载 CMAF 音视频分片后 MediaMuxer 合并

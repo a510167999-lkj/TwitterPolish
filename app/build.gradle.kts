@@ -11,8 +11,8 @@ android {
         applicationId = "com.polish.twitter"
         minSdk = 26
         targetSdk = 34
-        versionCode = 10001
-        versionName = "1.0.1"
+        versionCode = 10002
+        versionName = "1.0.2"
 
         ndk {
             abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a"))

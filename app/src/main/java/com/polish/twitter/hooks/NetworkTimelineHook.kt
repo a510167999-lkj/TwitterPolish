@@ -229,7 +229,9 @@ class NetworkTimelineHook : BaseHook() {
 
             try {
                 MediaCache.ingestJson(rawJson)
-            } catch (_: Throwable) {}
+            } catch (t: Throwable) {
+                Logger.w("MediaCache ingest failed: ${t.message}")
+            }
 
             val processedJson = TimelineProcessor.processTimelineResponse(
                 rawJson = rawJson,
