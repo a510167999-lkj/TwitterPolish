@@ -16,8 +16,11 @@ import android.provider.MediaStore
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import com.polish.twitter.core.Logger
+import com.polish.twitter.processor.ExtractedMedia
+import com.polish.twitter.processor.MediaExtractor
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
@@ -31,27 +34,29 @@ object Downloader {
 
     private const val CHANNEL_ID = "twitter_polish_download_channel"
     private const val CHANNEL_NAME = "TwitterPolish 媒体下载"
+    private const val MIN_VIDEO_BYTES = 50_000L
 
-    /**
-     * 启动带实时通知栏进度的后台下载任务
-     *
-     * @param context  Context（用于创建通知与保存文件）
-     * @param downloadUrl  视频/图片直链
-     * @param fileName  文件名（含后缀）
-     * @param isVideo  是否为视频
-     */
+    fun download(context: Context, media: ExtractedMedia) {
+        download(context, media.url, media.fileName, media.isVideo)
+    }
+
     fun download(context: Context, downloadUrl: String, fileName: String, isVideo: Boolean) {
         val cleanUrl = downloadUrl.trim()
         if (cleanUrl.isBlank()) {
             showToast(context, "❌ 下载链接无效")
             return
         }
+        if (isVideo && MediaExtractor.isDashSegmentUrl(cleanUrl)) {
+            Logger.w("Refusing DASH segment URL: $cleanUrl")
+            showToast(context, "❌ 这是播放器分片，不是完整视频。请打开推文或复制链接后再试")
+            return
+        }
 
-        showToast(context, "📥 开始下载${if (isVideo) "视频" else "图片"}，请查看通知栏进度...")
+        showToast(context, "📥 开始下载${if (isVideo) "视频" else "图片"}…")
         Logger.i("Download requested: $cleanUrl -> $fileName")
 
         executor.execute {
-            performDownload(context, cleanUrl, fileName, isVideo)
+            performDownload(context.applicationContext, cleanUrl, fileName, isVideo)
         }
     }
 
@@ -68,41 +73,26 @@ object Downloader {
             .setOngoing(true)
             .setOnlyAlertOnce(true)
 
-        notificationManager?.notify(notificationId, notificationBuilder.build())
+        tryNotify(notificationManager, notificationId, notificationBuilder.build())
 
-        var connection: HttpURLConnection? = null
         var outputStream: java.io.OutputStream? = null
         var outputUri: Uri? = null
+        var opened: HostOkHttp.OpenedStream? = null
+        var connection: HttpURLConnection? = null
 
         try {
             Logger.i("Connecting to: $downloadUrl")
-            val url = URL(downloadUrl)
-            connection = url.openConnection() as HttpURLConnection
-            connection.instanceFollowRedirects = true
-            connection.connectTimeout = 20000
-            connection.readTimeout = 90000
-            // 与 X 客户端同款 UA，防 CDN 403
-            connection.setRequestProperty(
-                "User-Agent",
-                "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-            )
-            connection.setRequestProperty("Referer", "https://x.com/")
-            connection.setRequestProperty("Accept", "video/mp4,video/webm,video/*,*/*;q=0.9")
-            connection.setRequestProperty("Accept-Encoding", "identity")
-            connection.connect()
+            val source = openSource(downloadUrl)
+            opened = source.okHttp
+            connection = source.connection
+            val inputStream = source.stream
+            var totalBytes = source.contentLength
 
-            val responseCode = connection.responseCode
-            Logger.i("HTTP $responseCode for $downloadUrl")
-            if (responseCode !in 200..299) {
-                throw RuntimeException("HTTP 错误 $responseCode")
+            if (isVideo && totalBytes in 1 until MIN_VIDEO_BYTES) {
+                throw RuntimeException("CDN 返回的是 ${totalBytes}B 分片，不是完整视频")
             }
 
-            val totalBytes = connection.contentLengthLong
-            val inputStream = connection.inputStream
-
-            // ------- 根据 Android 版本选择不同的写入策略 -------
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // Android 10+: 使用 MediaStore API，无需 WRITE_EXTERNAL_STORAGE 权限
                 val mimeType = if (isVideo) "video/mp4" else "image/jpeg"
                 val collection = if (isVideo)
                     MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
@@ -124,7 +114,6 @@ object Downloader {
                 outputStream = context.contentResolver.openOutputStream(outputUri)
                     ?: throw RuntimeException("无法打开 MediaStore 输出流")
             } else {
-                // Android 9 及以下：直接写入外部存储
                 val dirType = if (isVideo) Environment.DIRECTORY_MOVIES else Environment.DIRECTORY_PICTURES
                 val dir = File(Environment.getExternalStoragePublicDirectory(dirType), "Twitter")
                 dir.mkdirs()
@@ -133,13 +122,28 @@ object Downloader {
                 outputStream = FileOutputStream(outFile)
             }
 
-            // ------- 流式写入 + 通知进度 -------
             val buffer = ByteArray(16 * 1024)
             var bytesRead: Int
             var totalRead = 0L
             var lastNotifyMs = 0L
+            var headerChecked = !isVideo
+            val headerBuf = ByteArray(32)
+            var headerLen = 0
 
             while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                if (!headerChecked) {
+                    val copy = minOf(bytesRead, headerBuf.size - headerLen)
+                    if (copy > 0) {
+                        System.arraycopy(buffer, 0, headerBuf, headerLen, copy)
+                        headerLen += copy
+                    }
+                    if (headerLen >= 12) {
+                        if (!MediaExtractor.isPlayableMp4Header(headerBuf.copyOf(headerLen))) {
+                            throw RuntimeException("文件不是完整 MP4（播放器分片），已中止")
+                        }
+                        headerChecked = true
+                    }
+                }
                 outputStream!!.write(buffer, 0, bytesRead)
                 totalRead += bytesRead
 
@@ -152,8 +156,15 @@ object Downloader {
                     notificationBuilder
                         .setProgress(100, pct, false)
                         .setContentText("$pct% ($readMb / $totalMb MB)")
-                    notificationManager?.notify(notificationId, notificationBuilder.build())
+                    tryNotify(notificationManager, notificationId, notificationBuilder.build())
                 }
+            }
+
+            if (isVideo && !headerChecked) {
+                throw RuntimeException("视频数据过短，不是完整文件")
+            }
+            if (isVideo && totalRead < MIN_VIDEO_BYTES) {
+                throw RuntimeException("只下到 ${totalRead}B，不是完整视频")
             }
 
             outputStream!!.flush()
@@ -161,14 +172,12 @@ object Downloader {
             outputStream = null
             inputStream.close()
 
-            // MediaStore: 将 IS_PENDING 清零，让相册可见
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && outputUri != null) {
                 val cv = ContentValues().apply {
                     put(if (isVideo) MediaStore.Video.Media.IS_PENDING else MediaStore.Images.Media.IS_PENDING, 0)
                 }
                 context.contentResolver.update(outputUri, cv, null, null)
             } else {
-                // Legacy: 手动通知媒体库
                 val filePath = outputUri?.path ?: return
                 MediaScannerConnection.scanFile(
                     context,
@@ -180,7 +189,6 @@ object Downloader {
 
             Logger.i("Download complete: $fileName (${totalRead / 1024} KB)")
 
-            // ------- 完成通知 -------
             val viewIntent = Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(outputUri, if (isVideo) "video/*" else "image/*")
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -198,14 +206,13 @@ object Downloader {
                 .setContentIntent(pi)
                 .setAutoCancel(true)
                 .build()
-            notificationManager?.notify(notificationId, doneNotif)
-            showToast(context, "✅ 下载完成")
+            tryNotify(notificationManager, notificationId, doneNotif)
+            showToast(context, "✅ 下载完成（${totalRead / 1024} KB）")
 
         } catch (e: Throwable) {
             Logger.e("Download failed: ${e.message}", e)
             outputStream?.runCatching { close() }
 
-            // 回滚 MediaStore 中的挂起条目
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && outputUri != null) {
                 try { context.contentResolver.delete(outputUri, null, null) } catch (_: Throwable) {}
             }
@@ -218,10 +225,59 @@ object Downloader {
                 .setOngoing(false)
                 .setAutoCancel(true)
                 .build()
-            notificationManager?.notify(notificationId, errNotif)
+            tryNotify(notificationManager, notificationId, errNotif)
             showToast(context, "❌ 下载失败: ${e.localizedMessage}")
         } finally {
+            opened?.close?.invoke()
             connection?.disconnect()
+        }
+    }
+
+    private data class Source(
+        val stream: InputStream,
+        val contentLength: Long,
+        val okHttp: HostOkHttp.OpenedStream?,
+        val connection: HttpURLConnection?
+    )
+
+    private fun openSource(downloadUrl: String): Source {
+        val viaOkHttp = HostOkHttp.open(downloadUrl)
+        if (viaOkHttp != null) {
+            Logger.i("Downloading via host OkHttp, length=${viaOkHttp.contentLength}")
+            return Source(viaOkHttp.stream, viaOkHttp.contentLength, viaOkHttp, null)
+        }
+
+        Logger.i("Host OkHttp unavailable, falling back to HttpURLConnection")
+        val url = URL(downloadUrl)
+        val connection = url.openConnection() as HttpURLConnection
+        connection.instanceFollowRedirects = true
+        connection.connectTimeout = 20000
+        connection.readTimeout = 90000
+        connection.setRequestProperty(
+            "User-Agent",
+            "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+        )
+        connection.setRequestProperty("Referer", "https://x.com/")
+        connection.setRequestProperty("Origin", "https://x.com")
+        connection.setRequestProperty("Accept", "video/mp4,image/jpeg,image/*,*/*;q=0.8")
+        connection.setRequestProperty("Accept-Encoding", "identity")
+        HostOkHttp.cookie?.let { connection.setRequestProperty("Cookie", it) }
+        connection.connect()
+
+        val responseCode = connection.responseCode
+        Logger.i("HTTP $responseCode for $downloadUrl")
+        if (responseCode !in 200..299) {
+            connection.disconnect()
+            throw RuntimeException("HTTP 错误 $responseCode")
+        }
+        return Source(connection.inputStream, connection.contentLengthLong, null, connection)
+    }
+
+    private fun tryNotify(nm: NotificationManager?, id: Int, notification: android.app.Notification) {
+        try {
+            nm?.notify(id, notification)
+        } catch (t: Throwable) {
+            Logger.d("Notification dropped (POST_NOTIFICATIONS?): ${t.message}")
         }
     }
 
@@ -232,7 +288,11 @@ object Downloader {
                 enableVibration(false)
                 enableLights(false)
             }
-            nm.createNotificationChannel(ch)
+            try {
+                nm.createNotificationChannel(ch)
+            } catch (t: Throwable) {
+                Logger.d("createNotificationChannel: ${t.message}")
+            }
         }
     }
 

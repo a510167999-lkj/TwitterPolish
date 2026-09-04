@@ -4,8 +4,9 @@ import android.content.Context
 import com.polish.twitter.core.Constants
 import com.polish.twitter.core.DexKitManager
 import com.polish.twitter.core.Logger
-import com.polish.twitter.hooks.MediaDownloadHook
+import com.polish.twitter.processor.MediaCache
 import com.polish.twitter.processor.TimelineProcessor
+import com.polish.twitter.utils.HostOkHttp
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
@@ -38,6 +39,17 @@ class NetworkTimelineHook : BaseHook() {
         try {
             val realCallClass = classLoader.loadClass("okhttp3.internal.connection.RealCall")
             val hook = object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    HostOkHttp.captureClient(param.thisObject)
+                    try {
+                        val req = XposedHelpers.getObjectField(param.thisObject, "originalRequest")
+                        if (req != null) {
+                            HostOkHttp.captureAuthFromRequest(req)
+                        }
+                    } catch (_: Throwable) {
+                    }
+                }
+
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val resp = param.result ?: return
                     try {
@@ -215,9 +227,8 @@ class NetworkTimelineHook : BaseHook() {
                 String(rawBytes, Charsets.UTF_8)
             }
 
-            // 同步提取 GraphQL 响应中的视频 URL（video_info.variants）
             try {
-                MediaDownloadHook.inspectJsonForVideoUrls(rawJson)
+                MediaCache.ingestJson(rawJson)
             } catch (_: Throwable) {}
 
             val processedJson = TimelineProcessor.processTimelineResponse(

@@ -16,7 +16,7 @@ import android.widget.TextView
 import android.widget.Toast
 import com.polish.twitter.core.Constants
 import com.polish.twitter.core.Logger
-import com.polish.twitter.hooks.MediaDownloadHook
+import com.polish.twitter.processor.MediaCache
 import com.polish.twitter.utils.Downloader
 
 object SettingsDialog {
@@ -74,13 +74,11 @@ object SettingsDialog {
             val btnQuickDownload = Button(activity).apply {
                 text = "📥 下载当前媒体 / 查看下载说明"
                 setOnClickListener {
-                    val mediaUrl = MediaDownloadHook.latestVideoUrl ?: MediaDownloadHook.graphqlVideoUrl
-                    if (!mediaUrl.isNullOrBlank()) {
-                        val isVideo = mediaUrl.contains(".mp4") || mediaUrl.contains("video.twimg.com")
-                        val fileName = "twitter_${System.currentTimeMillis()}.${if (isVideo) "mp4" else "jpg"}"
-                        Downloader.download(activity, mediaUrl, fileName, isVideo)
+                    val media = MediaCache.resolve()
+                    if (media.isNotEmpty()) {
+                        Downloader.download(activity, media.first())
                     } else {
-                        Toast.makeText(activity, "💡 提示：在推文右下角点击“分享 -> 复制链接”，或长按媒体画面即可直接下载！", Toast.LENGTH_LONG).show()
+                        Toast.makeText(activity, "💡 先打开带视频的推文，或分享→复制链接，再点下载。播放器画面长按也可。", Toast.LENGTH_LONG).show()
                     }
                 }
             }

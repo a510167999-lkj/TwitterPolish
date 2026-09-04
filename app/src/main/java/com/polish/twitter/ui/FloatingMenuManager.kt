@@ -15,7 +15,7 @@ import android.widget.TextView
 import android.widget.Toast
 import com.polish.twitter.core.Constants
 import com.polish.twitter.core.Logger
-import com.polish.twitter.hooks.MediaDownloadHook
+import com.polish.twitter.processor.MediaCache
 import com.polish.twitter.utils.Downloader
 
 object FloatingMenuManager {
@@ -134,22 +134,21 @@ object FloatingMenuManager {
         val options = mutableListOf<String>()
         val actions = mutableListOf<() -> Unit>()
 
-        val videoUrl = MediaDownloadHook.latestVideoUrl
-        val mediaUrl = MediaDownloadHook.graphqlVideoUrl
+        val mediaItems = MediaCache.resolve()
+        val videos = mediaItems.filter { it.isVideo }
+        val photos = mediaItems.filter { !it.isVideo }
 
-        if (!videoUrl.isNullOrBlank()) {
-            options.add("📥 下载当前播放的视频 (1080p)")
+        if (videos.isNotEmpty()) {
+            options.add("📥 下载当前视频")
             actions.add {
-                val fileName = "twitter_video_${System.currentTimeMillis()}.mp4"
-                Downloader.download(activity, videoUrl, fileName, true)
+                Downloader.download(activity, videos.first())
             }
         }
 
-        if (!mediaUrl.isNullOrBlank() && mediaUrl != videoUrl) {
-            options.add("📥 下载当前查看的高清原图")
+        photos.forEachIndexed { index, photo ->
+            options.add("🖼️ 下载原图 ${index + 1}")
             actions.add {
-                val fileName = "twitter_image_${System.currentTimeMillis()}.jpg"
-                Downloader.download(activity, mediaUrl, fileName, false)
+                Downloader.download(activity, photo)
             }
         }
 
