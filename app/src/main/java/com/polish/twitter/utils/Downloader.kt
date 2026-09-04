@@ -87,17 +87,32 @@ object Downloader {
 
         var connection: HttpURLConnection? = null
         try {
-            val url = URL(downloadUrl)
+            // 清理 URL：去除可能导致鉴权问题的追踪参数（保留 tag 参数）
+            val cleanedUrl = downloadUrl.let {
+                // video.twimg.com 直链不需要额外参数清理，但需要处理 CDN 签名参数
+                if (it.contains("video.twimg.com") && it.contains("?")) it.substringBefore("?") + "?" + it.substringAfter("?").split("&").filter { p -> p.startsWith("tag=") || p.startsWith("container=") }.joinToString("&")
+                else it
+            }.trimEnd('?').trimEnd('&')
+
+            Logger.i("Starting download: $cleanedUrl")
+            val url = URL(cleanedUrl)
             connection = url.openConnection() as HttpURLConnection
-            connection.connectTimeout = 15000
-            connection.readTimeout = 30000
-            connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Android; Mobile)")
+            connection.instanceFollowRedirects = true
+            connection.connectTimeout = 20000
+            connection.readTimeout = 60000
+            // Twitter CDN 需要的请求头，防止 403
+            connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+            connection.setRequestProperty("Referer", "https://x.com/")
+            connection.setRequestProperty("Accept", "video/webm,video/mp4,video/*,*/*;q=0.9")
+            connection.setRequestProperty("Accept-Encoding", "identity")
+            connection.setRequestProperty("Range", "bytes=0-")
             connection.connect()
 
             val responseCode = connection.responseCode
-            if (responseCode !in 200..299) {
-                throw RuntimeException("HTTP 响应错误: $responseCode")
+            if (responseCode !in 200..299 && responseCode != 206) {
+                throw RuntimeException("HTTP 响应错误: $responseCode (URL: $cleanedUrl)")
             }
+
 
             val totalBytes = connection.contentLength.toLong()
             val input = connection.inputStream

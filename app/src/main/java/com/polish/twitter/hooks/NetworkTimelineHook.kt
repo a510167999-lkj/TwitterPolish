@@ -4,6 +4,7 @@ import android.content.Context
 import com.polish.twitter.core.Constants
 import com.polish.twitter.core.DexKitManager
 import com.polish.twitter.core.Logger
+import com.polish.twitter.hooks.MediaDownloadHook
 import com.polish.twitter.processor.TimelineProcessor
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
@@ -213,6 +214,11 @@ class NetworkTimelineHook : BaseHook() {
             } else {
                 String(rawBytes, Charsets.UTF_8)
             }
+
+            // 同步提取 GraphQL 响应中的视频 URL（video_info.variants）
+            try {
+                MediaDownloadHook.inspectJsonForVideoUrls(rawJson)
+            } catch (_: Throwable) {}
 
             val processedJson = TimelineProcessor.processTimelineResponse(
                 rawJson = rawJson,

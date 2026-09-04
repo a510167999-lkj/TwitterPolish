@@ -74,7 +74,7 @@ object SettingsDialog {
             val btnQuickDownload = Button(activity).apply {
                 text = "📥 下载当前媒体 / 查看下载说明"
                 setOnClickListener {
-                    val mediaUrl = MediaDownloadHook.latestMediaUrl ?: MediaDownloadHook.latestVideoUrl
+                    val mediaUrl = MediaDownloadHook.latestVideoUrl ?: MediaDownloadHook.graphqlVideoUrl
                     if (!mediaUrl.isNullOrBlank()) {
                         val isVideo = mediaUrl.contains(".mp4") || mediaUrl.contains("video.twimg.com")
                         val fileName = "twitter_${System.currentTimeMillis()}.${if (isVideo) "mp4" else "jpg"}"

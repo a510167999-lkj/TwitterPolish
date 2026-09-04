@@ -240,10 +240,7 @@ object TimelineProcessor {
             for (media in mediaList) {
                 if (media.isVideo) {
                     com.polish.twitter.hooks.MediaDownloadHook.latestVideoUrl = media.url
-                    com.polish.twitter.hooks.MediaDownloadHook.latestMediaUrl = media.url
                     break
-                } else if (com.polish.twitter.hooks.MediaDownloadHook.latestMediaUrl == null) {
-                    com.polish.twitter.hooks.MediaDownloadHook.latestMediaUrl = media.url
                 }
             }
         } catch (_: Throwable) {}

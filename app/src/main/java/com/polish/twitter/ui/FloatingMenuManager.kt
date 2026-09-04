@@ -135,7 +135,7 @@ object FloatingMenuManager {
         val actions = mutableListOf<() -> Unit>()
 
         val videoUrl = MediaDownloadHook.latestVideoUrl
-        val mediaUrl = MediaDownloadHook.latestMediaUrl
+        val mediaUrl = MediaDownloadHook.graphqlVideoUrl
 
         if (!videoUrl.isNullOrBlank()) {
             options.add("📥 下载当前播放的视频 (1080p)")
