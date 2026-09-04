@@ -260,45 +260,12 @@ class MediaDownloadHook : BaseHook() {
     // ----------- 策略3：视频播放器界面长按下载 ----------- //
 
     /**
-     * 通过两条路径让用户长按视频画面触发下载：
+     * 仅在全屏视频播放器 Activity 出现时（onWindowFocusChanged），
+     * 为播放器 View 绑定长按下载——不影响瀑布流 inline 视频的单击进入逻辑。
      *
-     * 路径 A：Hook View.onAttachedToWindow()
-     *   - SurfaceView / TextureView 是 ExoPlayer 的渲染目标
-     *   - 每当这类 View 被添加到窗口时，自动为其设置 OnLongClickListener
-     *
-     * 路径 B：Hook Activity.onWindowFocusChanged()
-     *   - 切换到视频全屏时，遍历当前 DecorView 树，为所有 SurfaceView / TextureView 设置长按
+     * 注意：不再 hook View.onAttachedToWindow（太激进，会拦截所有 SurfaceView 触摸事件）。
      */
     private fun hookVideoPlayerLongPress(classLoader: ClassLoader) {
-        // --- 路径 A: 监听 SurfaceView / TextureView attach ---
-        val longClickHook = object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                val view = param.thisObject as? View ?: return
-                val act = currentActivity ?: return
-                // 只处理视频相关的 View
-                val isVideoView = view is SurfaceView || view is TextureView ||
-                        view.javaClass.name.contains("Player", ignoreCase = true) ||
-                        view.javaClass.name.contains("Video", ignoreCase = true) ||
-                        view.javaClass.name.contains("Surface", ignoreCase = true) ||
-                        view.javaClass.name.contains("Texture", ignoreCase = true)
-                if (!isVideoView) return
-                if (view.isLongClickable) return   // 已设置过，跳过
-                view.isLongClickable = true
-                view.setOnLongClickListener {
-                    mainHandler.post { showDownloadDialogFromView(act) }
-                    true
-                }
-                Logger.d("Attached long-press download to: ${view.javaClass.simpleName}")
-            }
-        }
-        try {
-            XposedBridge.hookAllMethods(View::class.java, "onAttachedToWindow", longClickHook)
-            Logger.i("Hooked View.onAttachedToWindow for video long-press download")
-        } catch (e: Throwable) {
-            Logger.w("View.onAttachedToWindow hook failed: ${e.message}")
-        }
-
-        // --- 路径 B: Activity.onWindowFocusChanged 后扫描 DecorView ---
         try {
             XposedHelpers.findAndHookMethod(
                 Activity::class.java, "onWindowFocusChanged", Boolean::class.java,
@@ -308,35 +275,45 @@ class MediaDownloadHook : BaseHook() {
                         val hasFocus = param.args[0] as? Boolean ?: return
                         if (!hasFocus) return
                         currentActivity = act
+
+                        // 只在疑似全屏视频播放器的 Activity 里扫描
+                        val actName = act.javaClass.name.lowercase()
+                        val isVideoPlayerActivity =
+                            actName.contains("player") ||
+                            actName.contains("video") ||
+                            actName.contains("media") ||
+                            actName.contains("fullscreen") ||
+                            actName.contains("detail")   // 推文详情页也可能有视频
+
+                        if (!isVideoPlayerActivity) return
+
                         mainHandler.postDelayed({
-                            try {
-                                attachLongPressToVideoViews(act)
-                            } catch (_: Throwable) {}
-                        }, 400)
+                            try { attachLongPressToVideoViews(act) } catch (_: Throwable) {}
+                        }, 500)
                     }
                 }
             )
-            Logger.i("Hooked Activity.onWindowFocusChanged for video long-press scan")
+            Logger.i("Hooked Activity.onWindowFocusChanged for fullscreen video long-press")
         } catch (e: Throwable) {
-            Logger.w("onWindowFocusChanged hook failed: ${e.message}")
+            Logger.w("hookVideoPlayerLongPress failed: ${e.message}")
         }
     }
 
-    /** 递归遍历 View 树，为所有 SurfaceView / TextureView 设置长按下载 */
+    /** 递归遍历 View 树，为 SurfaceView / TextureView 绑定长按下载（不影响单击） */
     private fun attachLongPressToVideoViews(activity: Activity) {
         val decor = activity.window?.decorView ?: return
         val videoViews = mutableListOf<View>()
-        fun scanView(v: View) {
+        fun scan(v: View) {
             if (v is SurfaceView || v is TextureView ||
                 v.javaClass.name.contains("PlayerView", ignoreCase = true) ||
                 v.javaClass.name.contains("VideoView", ignoreCase = true)) {
                 videoViews.add(v)
             }
             if (v is android.view.ViewGroup) {
-                for (i in 0 until v.childCount) scanView(v.getChildAt(i))
+                for (i in 0 until v.childCount) scan(v.getChildAt(i))
             }
         }
-        scanView(decor)
+        scan(decor)
         for (v in videoViews) {
             if (!v.isLongClickable) {
                 v.isLongClickable = true
@@ -344,13 +321,13 @@ class MediaDownloadHook : BaseHook() {
                     showDownloadDialogFromView(activity)
                     true
                 }
-                Logger.d("Window scan: attached long-press to ${v.javaClass.simpleName}")
+                Logger.d("Attached long-press to video view: ${v.javaClass.simpleName}")
             }
         }
     }
 
     /**
-     * 从视频播放器界面发起的下载对话框（立即弹出，无需复制链接）
+     * 从视频播放器界面长按发起的下载对话框
      */
     private fun showDownloadDialogFromView(activity: Activity) {
         if (activity.isFinishing) return
