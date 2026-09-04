@@ -33,6 +33,20 @@ class HlsPlaylistParserTest {
     """.trimIndent()
 
     @Test
+    fun masterUrlWithQueryStillCountsAsMaster() {
+        assertTrue(
+            HlsPlaylistParser.isMasterPlaylistUrl(
+                "https://video.twimg.com/amplify_video/1/pl/Q1z5fx0TWVid4Wit.m3u8?tag=21"
+            )
+        )
+        assertFalse(
+            HlsPlaylistParser.isMasterPlaylistUrl(
+                "https://video.twimg.com/amplify_video/1/pl/avc1/720x1280/hi.m3u8?tag=21"
+            )
+        )
+    }
+
+    @Test
     fun masterPicksHighestResolutionAndMatchingAudioGroup() {
         val variants = HlsPlaylistParser.parseMaster(
             master,
@@ -63,20 +77,33 @@ class HlsPlaylistParserTest {
     }
 
     @Test
-    fun exoCacheKeysPreferHighestAvcPlaylistForThePlayingMediaId() {
+    fun exoCacheKeysPreferMasterOverThePlaying720pVariant() {
         val keys = listOf(
-            "https://video.twimg.com/amplify_video/111/pl/avc1/480x270/low.m3u8",
+            "https://video.twimg.com/amplify_video/2093578924810960896/pl/Q1z5fx0TWVid4Wit.m3u8?tag=21",
+            "https://video.twimg.com/amplify_video/2093578924810960896/pl/avc1/720x1280/hi.m3u8",
+            "https://video.twimg.com/amplify_video/2093578924810960896/pl/mp4a/32000/aud.m3u8",
+            "https://video.twimg.com/amplify_video/2093578924810960896/vid/avc1/57000/60000/720x1280/seg.m4s"
+        )
+        val picked = ExoCacheProbe.pickFromKeys(keys)!!
+        assertEquals("2093578924810960896", picked.mediaId)
+        assertTrue(
+            "Must use master so the downloader can pick 1080p instead of the playing 720p ladder",
+            HlsPlaylistParser.isMasterPlaylistUrl(picked.url)
+        )
+        assertFalse(picked.url.contains("/avc1/720x1280/"))
+        assertFalse(picked.url.endsWith(".m4s"))
+    }
+
+    @Test
+    fun exoCacheFallsBackToHighestCachedVariantWhenMasterMissing() {
+        val keys = listOf(
+            "https://video.twimg.com/amplify_video/2093578924810960896/pl/avc1/480x270/low.m3u8",
             "https://video.twimg.com/amplify_video/2093578924810960896/pl/avc1/720x1280/hi.m3u8",
             "https://video.twimg.com/amplify_video/2093578924810960896/pl/mp4a/128000/aud.m3u8",
             "https://video.twimg.com/amplify_video/2093578924810960896/vid/avc1/57000/60000/720x1280/seg.m4s"
         )
         val picked = ExoCacheProbe.pickFromKeys(keys)!!
-        assertEquals("2093578924810960896", picked.mediaId)
         assertTrue(picked.url.contains("/pl/avc1/720x1280/"))
         assertTrue(picked.hlsAudioUrl.contains("/pl/mp4a/128000/"))
-        assertFalse(
-            "Must not offer a .m4s fragment as the download URL",
-            picked.url.endsWith(".m4s")
-        )
     }
 }

@@ -23,6 +23,25 @@ object HlsPlaylistParser {
         return text.contains("#EXT-X-STREAM-INF")
     }
 
+    /** master 是 /pl/{token}.m3u8，变体才是 /pl/avc1/WxH/。下载必须走 master 才能拿到片源最高档。 */
+    fun isMasterPlaylistUrl(url: String): Boolean {
+        if (!url.contains(".m3u8", ignoreCase = true)) return false
+        if (url.contains("/avc1/") || url.contains("/mp4a/")) return false
+        return Regex("""/pl/[^/?]+\.m3u8""", RegexOption.IGNORE_CASE).containsMatchIn(url)
+    }
+
+    fun variantPixels(url: String): Long {
+        val m = Regex("""/avc1/(\d+)x(\d+)/""").find(url) ?: return 0L
+        val w = m.groupValues[1].toLongOrNull() ?: 0L
+        val h = m.groupValues[2].toLongOrNull() ?: 0L
+        return w * h
+    }
+
+    fun qualityRank(url: String): Long {
+        if (isMasterPlaylistUrl(url)) return Long.MAX_VALUE
+        return variantPixels(url)
+    }
+
     fun parseMaster(text: String, playlistUrl: String): List<Variant> {
         val audioByGroup = mutableMapOf<String, String>()
         val lines = text.lines().map { it.trim() }.filter { it.isNotEmpty() }

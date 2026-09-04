@@ -16,6 +16,7 @@ import android.widget.Toast
 import com.polish.twitter.core.Constants
 import com.polish.twitter.core.Logger
 import com.polish.twitter.processor.ExtractedMedia
+import com.polish.twitter.processor.HlsPlaylistParser
 import com.polish.twitter.processor.MediaCache
 import com.polish.twitter.processor.MediaExtractor
 import com.polish.twitter.utils.Downloader
@@ -372,10 +373,19 @@ class MediaDownloadHook : BaseHook() {
     private fun showDownloadChooser(activity: Activity, tweetId: String? = null) {
         if (activity.isFinishing) return
         var items = MediaCache.resolve(tweetId)
-        if (items.none { it.isVideo }) {
-            val hls = ExoCacheProbe.findCurrentHls(activity, MediaCache.currentMediaId)
-            if (hls != null) {
-                items = listOf(hls) + items.filter { !it.isVideo }
+        val hls = ExoCacheProbe.findCurrentHls(activity, MediaCache.currentMediaId)
+        if (hls != null) {
+            val videoIdx = items.indexOfFirst { it.isVideo }
+            val existing = items.getOrNull(videoIdx)
+            val existingIsProgressive = existing != null && MediaExtractor.isProgressiveMp4Url(existing.url)
+            val existingRank = existing?.url?.let { HlsPlaylistParser.qualityRank(it) } ?: -1L
+            val hlsRank = HlsPlaylistParser.qualityRank(hls.url)
+            if (!existingIsProgressive && (videoIdx < 0 || hlsRank >= existingRank)) {
+                items = if (videoIdx < 0) {
+                    listOf(hls) + items
+                } else {
+                    items.toMutableList().also { it[videoIdx] = hls }
+                }
             }
         }
         if (items.isEmpty()) {
@@ -393,7 +403,7 @@ class MediaDownloadHook : BaseHook() {
 
         val labels = items.map { media ->
             if (media.isVideo) {
-                if (MediaExtractor.isHlsPlaylistUrl(media.url)) "📥 合成下载当前视频（HLS）"
+                if (MediaExtractor.isHlsPlaylistUrl(media.url)) "📥 合成下载最高清视频"
                 else {
                     val kbps = if (media.bitrate > 0) " ${media.bitrate / 1000}kbps" else ""
                     "📥 视频$kbps"
@@ -415,7 +425,7 @@ class MediaDownloadHook : BaseHook() {
     private fun confirmDownload(activity: Activity, media: ExtractedMedia) {
         val kind = if (media.isVideo) "视频" else "原图"
         val extra = if (media.isVideo && MediaExtractor.isHlsPlaylistUrl(media.url)) {
-            "\n将从播放器 HLS 流合成完整 MP4（含音轨）。"
+            "\n将从播放列表选取最高分辨率并合成完整 MP4（含音轨）。"
         } else ""
         AlertDialog.Builder(activity)
             .setTitle("📥 下载$kind")

@@ -4,6 +4,7 @@ import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import com.polish.twitter.core.Logger
 import com.polish.twitter.processor.ExtractedMedia
+import com.polish.twitter.processor.HlsPlaylistParser
 import com.polish.twitter.processor.MediaExtractor
 import java.io.File
 
@@ -13,42 +14,40 @@ import java.io.File
  */
 object ExoCacheProbe {
 
-    private val AVC_PLAYLIST = Regex("""/pl/avc1/(\d+)x(\d+)/[^?\s]+\.m3u8""")
     private val AUDIO_PLAYLIST = Regex("""/pl/mp4a/(\d+)/[^?\s]+\.m3u8""")
-    private val MASTER_PLAYLIST = Regex("""/pl/[^/]+\.m3u8""")
 
     fun findCurrentHls(context: Context, preferredMediaId: String? = null): ExtractedMedia? {
-        val keys = readCacheKeys(context)
+        val picked = pickFromKeys(readCacheKeys(context), preferredMediaId) ?: return null
+        Logger.i("ExoCache HLS media=${picked.mediaId} url=${picked.url} audio=${picked.hlsAudioUrl}")
+        return picked
+    }
+
+    internal fun pickFromKeys(keys: List<String>, preferredMediaId: String? = null): ExtractedMedia? {
         if (keys.isEmpty()) return null
-
-        val recentMediaId = keys.asReversed()
-            .asSequence()
-            .mapNotNull { MediaExtractor.extractMediaId(it) }
-            .firstOrNull()
-
+        val recentMediaId = keys.asReversed().asSequence().mapNotNull { MediaExtractor.extractMediaId(it) }.firstOrNull()
         val mediaId = preferredMediaId?.takeIf { it.isNotBlank() } ?: recentMediaId
         val scoped = if (mediaId != null) {
-            val matched = keys.filter { MediaExtractor.extractMediaId(it) == mediaId }
-            matched.ifEmpty { keys }
+            keys.filter { MediaExtractor.extractMediaId(it) == mediaId }.ifEmpty { keys }
         } else {
             keys
         }
 
+        var master: String? = null
         var bestVideo: String? = null
-        var bestPixels = -1
+        var bestPixels = -1L
         var bestAudio: String? = null
         var bestAudioRate = -1
-        var master: String? = null
 
         for (key in scoped) {
             if (!key.contains(".m3u8", ignoreCase = true)) continue
-            val avc = AVC_PLAYLIST.find(key)
-            if (avc != null) {
-                val px = (avc.groupValues[1].toIntOrNull() ?: 0) * (avc.groupValues[2].toIntOrNull() ?: 0)
-                if (px >= bestPixels) {
-                    bestPixels = px
-                    bestVideo = key
-                }
+            if (HlsPlaylistParser.isMasterPlaylistUrl(key)) {
+                master = key
+                continue
+            }
+            val px = HlsPlaylistParser.variantPixels(key)
+            if (px > 0 && px >= bestPixels) {
+                bestPixels = px
+                bestVideo = key
                 continue
             }
             val aud = AUDIO_PLAYLIST.find(key)
@@ -58,72 +57,19 @@ object ExoCacheProbe {
                     bestAudioRate = rate
                     bestAudio = key
                 }
-                continue
-            }
-            if (MASTER_PLAYLIST.containsMatchIn(key) && !key.contains("/avc1/") && !key.contains("/mp4a/")) {
-                master = key
             }
         }
 
-        val url = bestVideo ?: master ?: return null
-        val id = MediaExtractor.extractMediaId(url) ?: mediaId ?: "hls"
-        Logger.i("ExoCache HLS media=$id video=$url audio=$bestAudio")
-        return ExtractedMedia(
-            url = url,
-            isVideo = true,
-            fileName = "twitter_${id}_video.mp4",
-            bitrate = if (bestPixels > 0) bestPixels.toLong() else bestAudioRate.toLong(),
-            width = 0,
-            height = 0,
-            tweetId = "",
-            mediaId = id,
-            hlsAudioUrl = bestAudio ?: ""
-        )
-    }
-
-    internal fun pickFromKeys(keys: List<String>, preferredMediaId: String? = null): ExtractedMedia? {
-        // used by tests — mirrors findCurrentHls without Android
-        if (keys.isEmpty()) return null
-        val recentMediaId = keys.asReversed().asSequence().mapNotNull { MediaExtractor.extractMediaId(it) }.firstOrNull()
-        val mediaId = preferredMediaId ?: recentMediaId
-        val scoped = if (mediaId != null) keys.filter { MediaExtractor.extractMediaId(it) == mediaId }.ifEmpty { keys } else keys
-        var bestVideo: String? = null
-        var bestPixels = -1
-        var bestAudio: String? = null
-        var bestAudioRate = -1
-        var master: String? = null
-        for (key in scoped) {
-            if (!key.contains(".m3u8", ignoreCase = true)) continue
-            val avc = AVC_PLAYLIST.find(key)
-            if (avc != null) {
-                val px = (avc.groupValues[1].toIntOrNull() ?: 0) * (avc.groupValues[2].toIntOrNull() ?: 0)
-                if (px >= bestPixels) {
-                    bestPixels = px
-                    bestVideo = key
-                }
-                continue
-            }
-            val aud = AUDIO_PLAYLIST.find(key)
-            if (aud != null) {
-                val rate = aud.groupValues[1].toIntOrNull() ?: 0
-                if (rate >= bestAudioRate) {
-                    bestAudioRate = rate
-                    bestAudio = key
-                }
-                continue
-            }
-            if (MASTER_PLAYLIST.containsMatchIn(key) && !key.contains("/avc1/") && !key.contains("/mp4a/")) {
-                master = key
-            }
-        }
-        val url = bestVideo ?: master ?: return null
+        // master 列出全部档位；变体只是播放器当前在拉的那一档（常见 720p）
+        val url = master ?: bestVideo ?: return null
         val id = MediaExtractor.extractMediaId(url) ?: mediaId ?: "hls"
         return ExtractedMedia(
             url = url,
             isVideo = true,
             fileName = "twitter_${id}_video.mp4",
+            bitrate = bestPixels,
             mediaId = id,
-            hlsAudioUrl = bestAudio ?: ""
+            hlsAudioUrl = if (master != null) "" else (bestAudio ?: "")
         )
     }
 

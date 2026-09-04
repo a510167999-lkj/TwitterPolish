@@ -28,10 +28,12 @@ object HlsDownloader {
             val best = HlsPlaylistParser.pickBest(HlsPlaylistParser.parseMaster(masterText, playlistUrl))
                 ?: throw RuntimeException("HLS master 里没有可用视频流")
             videoPlaylist = best.videoUrl
-            if (audioPlaylist.isNullOrBlank()) audioPlaylist = best.audioUrl
-            Logger.i("HLS master picked ${best.width}x${best.height} bw=${best.bandwidth}")
+            audioPlaylist = best.audioUrl ?: audioPlaylist
+            onProgress("最高清 ${best.width}x${best.height}")
+            Logger.i("HLS master picked ${best.width}x${best.height} bw=${best.bandwidth} audio=${best.audioUrl}")
         } else {
             videoPlaylist = playlistUrl
+            Logger.i("HLS media playlist (no master): $playlistUrl")
         }
 
         onProgress("拉取视频分片…")

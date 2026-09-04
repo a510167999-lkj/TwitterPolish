@@ -142,6 +142,9 @@ object MediaCache {
             val curHls = MediaExtractor.isHlsPlaylistUrl(current.url)
             if (!cHls && curHls) return true
             if (cHls && !curHls) return false
+            if (cHls && curHls) {
+                return HlsPlaylistParser.qualityRank(candidate.url) > HlsPlaylistParser.qualityRank(current.url)
+            }
             return candidate.bitrate >= current.bitrate
         }
         return false
