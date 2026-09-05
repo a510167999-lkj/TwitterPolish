@@ -159,7 +159,7 @@ object TimelineProcessor {
 
             // 3. 提取推文 Snowflake ID
             val tweetId = extractTweetId(entry)
-            cacheMediaFromEntry(entry)
+            MediaCache.ingestObject(entry)
 
             if (tweetId > 0L) {
                 validTweetEntries.add(Pair(tweetId, entry))
@@ -223,27 +223,6 @@ object TimelineProcessor {
         bottomCursors.forEach { result.put(it) }
 
         return result
-    }
-
-    /**
-     * 自动从推文条目中解析并缓存视频与图片资源
-     */
-    private fun cacheMediaFromEntry(entry: JSONObject) {
-        try {
-            val content = entry.optJSONObject("content") ?: return
-            val itemContent = content.optJSONObject("itemContent") ?: return
-            val tweetResult = itemContent.optJSONObject("tweet_results")?.optJSONObject("result") ?: return
-            val legacy = tweetResult.optJSONObject("legacy") ?: tweetResult.optJSONObject("tweet")?.optJSONObject("legacy") ?: return
-            val tweetId = extractTweetId(entry)
-
-            val mediaList = MediaExtractor.extractMediaFromTweetJson(legacy, tweetId.toString())
-            for (media in mediaList) {
-                if (media.isVideo) {
-                    com.polish.twitter.hooks.MediaDownloadHook.latestVideoUrl = media.url
-                    break
-                }
-            }
-        } catch (_: Throwable) {}
     }
 
     /**
