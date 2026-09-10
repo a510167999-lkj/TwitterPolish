@@ -140,7 +140,7 @@ class LogoLongPressHook : BaseHook() {
                                 val dx = Math.abs(event.x - downX)
                                 val dy = Math.abs(event.y - downY)
                                 if (dx > slop || dy > slop) {
-                                    mainHandler.removeCallbacks(longPressRunnable!!)
+                                    longPressRunnable?.let { mainHandler.removeCallbacks(it) }
                                     longPressRunnable = null
                                 }
                             }

@@ -27,13 +27,16 @@ import com.polish.twitter.utils.PlayerPlaybackTracker
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
+import java.lang.ref.WeakReference
 
 class MediaDownloadHook : BaseHook() {
 
     override val name: String = "MediaDownloadHook"
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
     private var appContext: Context? = null
-    private var currentActivity: Activity? = null
+    // 用 WeakReference 避免持有 Activity 导致泄漏（Xposed Hook 实例进程常驻）
+    private var currentActivityRef: WeakReference<Activity>? = null
+    private val currentActivity get() = currentActivityRef?.get()
 
     private var pressDownX = 0f
     private var pressDownY = 0f
@@ -81,7 +84,7 @@ class MediaDownloadHook : BaseHook() {
                 Activity::class.java, "onResume",
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        currentActivity = param.thisObject as? Activity
+                        currentActivityRef = WeakReference(param.thisObject as? Activity ?: return)
                     }
                 }
             )

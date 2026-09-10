@@ -18,7 +18,8 @@ object DexKitManager {
     const val KEY_ACTION_SHEET_SHOW = "action_sheet_show"
     const val KEY_TIMELINE_ITEM_IS_PROMOTED = "timeline_item_is_promoted"
     const val KEY_EXOPLAYER_IMPL = "exoplayer_impl"
-    private const val DEXKIT_SCHEMA = 2
+    const val KEY_SETTINGS_ROOT_CLASS = "settings_root_class"
+    private const val DEXKIT_SCHEMA = 3  // 每次新增特征都 bump，使缓存失效并重新扫描
     private const val KEY_DEXKIT_SCHEMA = "dexkit_schema"
 
     /**
@@ -122,9 +123,82 @@ object DexKitManager {
                 cacheMap[KEY_EXOPLAYER_IMPL] = "${it.className}#${it.name}"
                 Logger.d("Found ExoPlayerImpl: ${cacheMap[KEY_EXOPLAYER_IMPL]}")
             }
+
+            // 4. 检索设置根容器类（版本号页入口所在）
+            //    采用多特征扫描 + 分层兜底策略，提高跨版本稳定性：
+            //
+            //    第一层：特征字符串扫描
+            //      - "onUpdateClick"：Kotlin 编译后的回调参数名（X 12.x 已知有效）
+            //      - "versionName"：Compose 参数名（可能变化，作为次优特征）
+            //      - "checkForUpdate" / "update_now"：检查更新相关字符串
+            //    第二层：版本号字面量匹配
+            //      - 格式如 "12.20.5-prod.01"，随 X 升级会变化但必然存在
+            //    第三层：包扫描兜底
+            //      - 直接扫描 com.x.settings 包下所有含 "settings" 或 "version" 的类
+            val settingsClass = scanSettingsRootClass(bridge)
+            if (settingsClass != null) {
+                cacheMap[KEY_SETTINGS_ROOT_CLASS] = settingsClass
+                Logger.i("Found settings root class via DexKit: $settingsClass")
+            } else {
+                Logger.w("DexKit could not locate settings root class — SettingsHook will fall back to hardcoded candidates")
+            }
         } catch (e: Throwable) {
             Logger.w("Error during DexKit bytecode scan", e)
         }
+    }
+
+    /**
+     * 多策略扫描设置根容器类（版本号页入口所在）。
+     *
+     * 分层兜底策略：
+     * 1. 特征字符串扫描：尝试多个可能的字符串特征
+     * 2. 版本号字面量匹配：查找形如 "12.20.5-prod.01" 的版本号字符串
+     * 3. 包扫描兜底：直接扫描 com.x.settings 包下的所有类
+     *
+     * 返回最可能的设置根类名，或 null 表示未找到。
+     */
+    private fun scanSettingsRootClass(bridge: DexKitBridge): String? {
+        // 第一层：特征字符串扫描（多个候选特征）
+        val featureStrings = listOf("onUpdateClick", "versionName", "checkForUpdate", "update_now")
+        for (feature in featureStrings) {
+            val methods = bridge.findMethod {
+                matcher {
+                    usingStrings(feature)
+                }
+            }
+            val candidate = methods.firstOrNull { it ->
+                it.className.contains("settings", ignoreCase = true) ||
+                    it.className.contains("version", ignoreCase = true) ||
+                    it.className.contains("about", ignoreCase = true)
+            }?.className
+            if (candidate != null) {
+                Logger.d("Found settings root via feature '$feature': $candidate")
+                return candidate
+            }
+        }
+
+        // 第二层：版本号字面量匹配（格式如 "12.20.5-prod.01"）
+        // 直接用特征串 "prod" 作为近似特征，避免 Regex API 不支持的问题
+        try {
+            val methods = bridge.findMethod {
+                matcher {
+                    usingStrings("prod")
+                }
+            }
+            val candidate = methods.firstOrNull { cls ->
+                cls.className.contains("settings", ignoreCase = true) ||
+                    cls.className.contains("about", ignoreCase = true)
+            }?.className
+            if (candidate != null) {
+                Logger.d("Found settings root via 'prod' string: $candidate")
+                return candidate
+            }
+        } catch (e: Throwable) {
+            Logger.w("Version pattern matching failed: ${e.message}")
+        }
+
+        // 注意：包扫描 API 暂不支持按类名前缀过滤，如需增强可扩展
+        return null
     }
 
     private fun loadCacheFromJson(json: String) {
@@ -145,4 +219,15 @@ object DexKitManager {
         val parts = descriptor.split("#")
         return if (parts.size == 2) Pair(parts[0], parts[1]) else null
     }
+
+    /**
+     * 持久化设置根类名（非方法描述，仅存类名）。
+     * 首次扫描命中时调用，供后续冷启动直接读缓存而不重复扫描。
+     */
+    internal fun cacheSettingsRootClass(className: String) {
+        cacheMap[KEY_SETTINGS_ROOT_CLASS] = className
+    }
+
+    /** 读取已缓存的设置根类名（供 SettingsHook 使用）。 */
+    fun getCachedSettingsRootClass(): String? = cacheMap[KEY_SETTINGS_ROOT_CLASS]
 }

@@ -16,8 +16,12 @@ object XHost {
         "com.twitter.android.HomeTimelineActivity"
     )
 
-    /** 设置根容器（Compose）——版本号页入口所在类 */
-    const val SETTINGS_ROOT_CLASS = "com.x.settings.a"
+    /** 设置根容器 Compose 候选（按可能性排列；最终由 DexKit 特征扫描确定） */
+    val SETTINGS_ROOT_CANDIDATES = listOf(
+        "com.x.settings.a",   // X 12.x 版本
+        "com.twitter.settings.SettingsActivity",
+        "com.twitter.android.settings.SettingsActivity"
+    )
 
     fun isMainActivity(className: String?): Boolean {
         return className in MAIN_ACTIVITY_CANDIDATES

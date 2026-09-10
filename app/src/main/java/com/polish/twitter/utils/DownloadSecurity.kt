@@ -19,10 +19,12 @@ object DownloadSecurity {
         "x.com"
     )
 
-    /** 完全不允许请求的域名黑名单关键词（防 SSRF 内网探测）。 */
+    /** 完全不允许请求的域名黑名单关键词（防 SSRF 内网探测）。
+     * 包含 IPv4 回环/私有地址、IPv6 回环、常见的本地服务主机名。 */
     private val BLOCKED_HOST_HINTS = listOf(
         "10.", "127.", "169.254.", "192.168.",
-        "localhost", ".local", ".internal", ".lan"
+        "localhost", ".local", ".internal", ".lan",
+        "::1", "0:0:0:0:0:0:0:1"  // IPv6 回环
     )
 
     fun isAllowedMediaUrl(url: String): Boolean {
