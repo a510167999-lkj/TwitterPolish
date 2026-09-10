@@ -23,11 +23,21 @@ object HlsPlaylistParser {
         return text.contains("#EXT-X-STREAM-INF")
     }
 
-    /** master 是 /pl/{token}.m3u8，变体才是 /pl/avc1/WxH/。下载必须走 master 才能拿到片源最高档。 */
+    /**
+     * master 列出全部分辨率；变体才是 /pl/avc1/WxH/ 这一档。
+     * GraphQL 里的 x-mpegURL 就是 master，路径不一定是 /pl/{token}.m3u8。
+     */
     fun isMasterPlaylistUrl(url: String): Boolean {
         if (!url.contains(".m3u8", ignoreCase = true)) return false
-        if (url.contains("/avc1/") || url.contains("/mp4a/")) return false
-        return Regex("""/pl/[^/?]+\.m3u8""", RegexOption.IGNORE_CASE).containsMatchIn(url)
+        val u = url.lowercase()
+        if (u.contains("/avc1/") || u.contains("/mp4a/") ||
+            u.contains("/hev1/") || u.contains("/hvc1/") ||
+            u.contains("/av01/") || u.contains("/vp09/")
+        ) {
+            return false
+        }
+        if (Regex("""/\d{2,5}x\d{2,5}/""").containsMatchIn(u)) return false
+        return true
     }
 
     fun variantPixels(url: String): Long {

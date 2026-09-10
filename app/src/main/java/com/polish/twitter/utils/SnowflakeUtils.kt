@@ -35,4 +35,11 @@ object SnowflakeUtils {
         val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
         return sdf.format(Date(timestamp))
     }
+
+    /**
+     * 由发布时间戳（epoch 毫秒）反算等价 Snowflake ID（用于无 ID 时的降级排序键）
+     */
+    fun pseudoSnowflakeFromEpochMs(epochMs: Long): Long {
+        return (epochMs - TWITTER_EPOCH) shl 22
+    }
 }

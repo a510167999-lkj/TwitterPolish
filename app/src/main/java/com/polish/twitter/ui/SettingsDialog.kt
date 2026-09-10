@@ -16,9 +16,8 @@ import android.widget.TextView
 import android.widget.Toast
 import com.polish.twitter.core.Constants
 import com.polish.twitter.core.Logger
-import com.polish.twitter.processor.MediaCache
+import com.polish.twitter.utils.DownloadResolver
 import com.polish.twitter.utils.Downloader
-import com.polish.twitter.utils.ExoCacheProbe
 
 object SettingsDialog {
 
@@ -61,7 +60,7 @@ object SettingsDialog {
             val cbMediaDownload = createCheckBox(activity, "📥 启用视频与原图下载", "在推文中长按图片或视频即可弹出最高清画质下载对话框", isMediaDownload, dp)
             rootLayout.addView(cbMediaDownload)
 
-            val isShowFloatingBall = prefs.getBoolean("show_floating_ball", true)
+            val isShowFloatingBall = prefs.getBoolean(Constants.PREF_SHOW_FLOATING_BALL, true)
 
             // 4. 默认进入关注流开关
             val cbDefaultFollowing = createCheckBox(activity, "🎯 默认进入【正在关注】标签页", "启动应用时优先显示正在关注流，而非算法推荐流", isDefaultFollowing, dp)
@@ -71,13 +70,11 @@ object SettingsDialog {
             val cbShowFloatingBall = createCheckBox(activity, "⚙️ 屏幕显示快捷悬浮球", "在屏幕边缘显示快捷齿轮，点击可快速打开设置或下载视频/原图", isShowFloatingBall, dp)
             rootLayout.addView(cbShowFloatingBall)
 
-            // 5. 快速下载当前媒体按钮
+            // 6. 快速下载当前媒体按钮
             val btnQuickDownload = Button(activity).apply {
                 text = "📥 下载当前媒体 / 查看下载说明"
                 setOnClickListener {
-                    val media = MediaCache.resolve().ifEmpty {
-                        listOfNotNull(ExoCacheProbe.findCurrentHls(activity, MediaCache.currentMediaId))
-                    }
+                    val media = DownloadResolver.resolve(activity)
                     if (media.isNotEmpty()) {
                         Downloader.download(activity, media.first())
                     } else {
@@ -95,13 +92,10 @@ object SettingsDialog {
                 .setTitle("✨ TwitterPolish 设置")
                 .setView(scrollView)
                 .setPositiveButton("保存并生效") { _, _ ->
-                    prefs.edit()
-                        .putBoolean(Constants.PREF_ENABLE_AD_BLOCK, cbAdBlock.isChecked)
-                        .putBoolean(Constants.PREF_ENABLE_CHRONO_SORT, cbChronoSort.isChecked)
-                        .putBoolean(Constants.PREF_ENABLE_MEDIA_DOWNLOAD, cbMediaDownload.isChecked)
-                        .putBoolean(Constants.PREF_ENABLE_DEFAULT_FOLLOWING, cbDefaultFollowing.isChecked)
-                        .putBoolean("show_floating_ball", cbShowFloatingBall.isChecked)
-                        .apply()
+                    saveAll(
+                        prefs, cbAdBlock, cbChronoSort, cbMediaDownload,
+                        cbDefaultFollowing, cbShowFloatingBall
+                    )
                     if (cbShowFloatingBall.isChecked) {
                         FloatingMenuManager.attach(activity)
                     } else {
@@ -110,13 +104,10 @@ object SettingsDialog {
                     Toast.makeText(activity, "✅ 设置已保存，刷新时间线即可生效", Toast.LENGTH_SHORT).show()
                 }
                 .setNeutralButton("重启 X 客户端") { _, _ ->
-                    prefs.edit()
-                        .putBoolean(Constants.PREF_ENABLE_AD_BLOCK, cbAdBlock.isChecked)
-                        .putBoolean(Constants.PREF_ENABLE_CHRONO_SORT, cbChronoSort.isChecked)
-                        .putBoolean(Constants.PREF_ENABLE_MEDIA_DOWNLOAD, cbMediaDownload.isChecked)
-                        .putBoolean(Constants.PREF_ENABLE_DEFAULT_FOLLOWING, cbDefaultFollowing.isChecked)
-                        .putBoolean("show_floating_ball", cbShowFloatingBall.isChecked)
-                        .apply()
+                    saveAll(
+                        prefs, cbAdBlock, cbChronoSort, cbMediaDownload,
+                        cbDefaultFollowing, cbShowFloatingBall
+                    )
                     restartApp(activity)
                 }
                 .setNegativeButton("取消", null)
@@ -124,6 +115,23 @@ object SettingsDialog {
         } catch (e: Throwable) {
             Logger.e("Failed to show TwitterPolish settings dialog", e)
         }
+    }
+
+    private fun saveAll(
+        prefs: android.content.SharedPreferences,
+        cbAdBlock: CheckBox,
+        cbChronoSort: CheckBox,
+        cbMediaDownload: CheckBox,
+        cbDefaultFollowing: CheckBox,
+        cbShowFloatingBall: CheckBox
+    ) {
+        prefs.edit()
+            .putBoolean(Constants.PREF_ENABLE_AD_BLOCK, cbAdBlock.isChecked)
+            .putBoolean(Constants.PREF_ENABLE_CHRONO_SORT, cbChronoSort.isChecked)
+            .putBoolean(Constants.PREF_ENABLE_MEDIA_DOWNLOAD, cbMediaDownload.isChecked)
+            .putBoolean(Constants.PREF_ENABLE_DEFAULT_FOLLOWING, cbDefaultFollowing.isChecked)
+            .putBoolean(Constants.PREF_SHOW_FLOATING_BALL, cbShowFloatingBall.isChecked)
+            .apply()
     }
 
     private fun createCheckBox(context: Context, title: String, subtitle: String, checked: Boolean, dp: Float): CheckBox {

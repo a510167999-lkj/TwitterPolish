@@ -219,7 +219,7 @@ object MediaExtractor {
             ?: obj.optJSONObject("media_info")
             ?: obj.optJSONObject("mediaInfo")
         if (videoInfo != null) {
-            val picked = pickBestProgressiveMp4(videoInfo) ?: pickBestHls(videoInfo)
+            val picked = pickBestDownloadVariant(videoInfo)
             picked?.let {
                 val mediaId = obj.optString("id_str").ifBlank {
                     extractMediaId(it.url) ?: tweetId
@@ -280,6 +280,32 @@ object MediaExtractor {
 
     private fun looksLikeTweetId(id: String): Boolean {
         return id.length in 15..20 && id.all { it.isDigit() }
+    }
+
+    /**
+     * 下载质量：HLS master（含 1080p 档）> 高分辨率 HLS 变体 > progressive 码率。
+     * GraphQL progressive 通常最高 720p，更高清只在 master 里。
+     */
+    fun downloadQuality(media: ExtractedMedia): Long {
+        val url = media.url
+        if (HlsPlaylistParser.isMasterPlaylistUrl(url)) return Long.MAX_VALUE
+        if (isHlsPlaylistUrl(url)) {
+            return 1_000_000_000L + HlsPlaylistParser.variantPixels(url)
+        }
+        return media.bitrate
+    }
+
+    /**
+     * 有 HLS master 就用 master，让合成器选片源最高档；没有才退回 progressive MP4。
+     */
+    internal fun pickBestDownloadVariant(videoInfo: JSONObject): ExtractedMedia? {
+        val hls = pickBestHls(videoInfo)
+        val progressive = pickBestProgressiveMp4(videoInfo)
+        if (hls != null && (HlsPlaylistParser.isMasterPlaylistUrl(hls.url) || progressive == null)) {
+            val bitrate = maxOf(hls.bitrate, progressive?.bitrate ?: 0L)
+            return if (bitrate != hls.bitrate) hls.copy(bitrate = bitrate) else hls
+        }
+        return progressive ?: hls
     }
 
     internal fun pickBestProgressiveMp4(videoInfo: JSONObject): ExtractedMedia? {

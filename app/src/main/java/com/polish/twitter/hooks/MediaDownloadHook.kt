@@ -5,6 +5,7 @@ import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.SharedPreferences
 import android.os.Handler
 import android.os.Looper
 import android.view.MotionEvent
@@ -19,9 +20,10 @@ import com.polish.twitter.processor.ExtractedMedia
 import com.polish.twitter.processor.HlsPlaylistParser
 import com.polish.twitter.processor.MediaCache
 import com.polish.twitter.processor.MediaExtractor
+import com.polish.twitter.utils.DownloadResolver
 import com.polish.twitter.utils.Downloader
-import com.polish.twitter.utils.ExoCacheProbe
 import com.polish.twitter.utils.HostOkHttp
+import com.polish.twitter.utils.PlayerPlaybackTracker
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
@@ -39,25 +41,30 @@ class MediaDownloadHook : BaseHook() {
     private var longPressRunnable: Runnable? = null
     private var trackingSurface = false
 
-    companion object {
-        /** 兼容旧调用点：返回当前可下载的 progressive MP4，而不是播放器 DASH 分片。 */
-        var latestVideoUrl: String?
-            get() = MediaCache.bestVideoUrl()
-            set(_) {}
-
-        var graphqlVideoUrl: String?
-            get() = MediaCache.bestVideoUrl()
-            set(_) {}
-
-        fun inspectJsonForVideoUrls(json: String) {
-            MediaCache.ingestJson(json)
-        }
-    }
+    // 下载开关缓存：触摸事件高频回调里不再每次读 SharedPreferences，
+    // 由监听器即时刷新。SharedPreferences 只持 WeakReference，必须留强引用。
+    @Volatile
+    private var downloadEnabled = true
+    private var prefsListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
 
     override fun init(classLoader: ClassLoader, context: Context) {
         this.appContext = context
         try {
+            val prefs = context.getSharedPreferences(Constants.PREFS_NAME, Context.MODE_PRIVATE)
+            downloadEnabled = prefs.getBoolean(Constants.PREF_ENABLE_MEDIA_DOWNLOAD, true)
+            val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+                if (key == Constants.PREF_ENABLE_MEDIA_DOWNLOAD) {
+                    downloadEnabled = prefs.getBoolean(Constants.PREF_ENABLE_MEDIA_DOWNLOAD, true)
+                }
+            }
+            prefsListener = listener
+            prefs.registerOnSharedPreferenceChangeListener(listener)
+        } catch (_: Throwable) {
+        }
+
+        try {
             hookActivityLifecycle()
+            PlayerPlaybackTracker.hook(classLoader)
             hookOkHttpVideoRequests(classLoader)
             hookExoPlayer(classLoader)
             hookMedia3DataSource(classLoader)
@@ -66,12 +73,6 @@ class MediaDownloadHook : BaseHook() {
         } catch (e: Throwable) {
             Logger.e("Failed to initialize MediaDownloadHook", e)
         }
-    }
-
-    private fun isDownloadEnabled(): Boolean {
-        val ctx = appContext ?: return true
-        return ctx.getSharedPreferences(Constants.PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(Constants.PREF_ENABLE_MEDIA_DOWNLOAD, true)
     }
 
     private fun hookActivityLifecycle() {
@@ -135,8 +136,9 @@ class MediaDownloadHook : BaseHook() {
             urlStr.contains("ext_tw_video") ||
             urlStr.contains("amplify_video")
         ) {
-            MediaCache.notePlaybackUrl(urlStr)
-            if (MediaExtractor.isHlsPlaylistUrl(urlStr)) {
+            MediaCache.notePlaybackUrl(urlStr, fromPlayer = false)
+            // 只把 master 当下载源。正在播的 480p 变体 playlist 不能覆盖 GraphQL 最高清。
+            if (HlsPlaylistParser.isMasterPlaylistUrl(urlStr)) {
                 val mediaId = MediaExtractor.extractMediaId(urlStr) ?: return
                 MediaCache.ingestObject(
                     org.json.JSONObject().put(
@@ -189,17 +191,15 @@ class MediaDownloadHook : BaseHook() {
                 classLoader.loadClass("com.google.android.exoplayer2.ExoPlayer")
             }
             XposedBridge.hookAllMethods(exoClass, "setMediaItem", object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    extractUriFromMediaItem(param.args.getOrNull(0))
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    PlayerPlaybackTracker.attach(param.thisObject)
+                    // 预取也会 setMediaItem，不能把 playlist 里下一条当成当前在播。
                 }
             })
             try {
                 XposedBridge.hookAllMethods(exoClass, "setMediaItems", object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val list = param.args.getOrNull(0) ?: return
-                        if (list is List<*>) {
-                            list.forEach { extractUriFromMediaItem(it) }
-                        }
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        PlayerPlaybackTracker.attach(param.thisObject)
                     }
                 })
             } catch (_: Throwable) {
@@ -207,19 +207,6 @@ class MediaDownloadHook : BaseHook() {
             Logger.i("ExoPlayer setMediaItem(s) hooked as playback-id capture.")
         } catch (e: Throwable) {
             Logger.w("ExoPlayer hook failed (non-fatal): ${e.message}")
-        }
-    }
-
-    private fun extractUriFromMediaItem(mediaItem: Any?) {
-        if (mediaItem == null) return
-        try {
-            val localConfig = XposedHelpers.getObjectField(mediaItem, "localConfiguration")
-            if (localConfig != null) {
-                val uri = XposedHelpers.getObjectField(localConfig, "uri")
-                val uriStr = uri?.toString() ?: return
-                notePlaybackIfVideo(uriStr)
-            }
-        } catch (_: Throwable) {
         }
     }
 
@@ -233,7 +220,7 @@ class MediaDownloadHook : BaseHook() {
             XposedBridge.hookMethod(dispatchTouchMethod, object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val activity = param.thisObject as? Activity ?: return
-                    if (!isDownloadEnabled()) return
+                    if (!downloadEnabled) return
                     val event = param.args[0] as? MotionEvent ?: return
                     handlePlayerTouch(activity, event, param)
                 }
@@ -257,17 +244,17 @@ class MediaDownloadHook : BaseHook() {
                 trackingSurface = false
                 if (event.y < headerGuard) return
 
-                val surface = findLargeVideoSurface(activity) ?: return
-                if (!touchInside(surface, event)) return
+                val surface = findTouchedVideoSurface(activity, event) ?: return
 
                 trackingSurface = true
                 pressDownX = event.x
                 pressDownY = event.y
+                val pressed = surface
                 val runnable = Runnable {
                     longPressFired = true
                     mainHandler.post {
                         if (!activity.isFinishing) {
-                            showDownloadChooser(activity)
+                            showDownloadChooser(activity, videoView = pressed)
                         }
                     }
                 }
@@ -301,25 +288,27 @@ class MediaDownloadHook : BaseHook() {
     }
 
     /**
-     * 全屏/详情播放器的画面通常占屏幕 32% 以上；瀑布流 inline 视频更小，避免误触。
+     * 手指下面的视频画面，不是全局最大的 Surface。
+     * ViewPager 里上一条/下一条往往同样大，按全局最大会绑到错的播放器。
      */
-    private fun findLargeVideoSurface(activity: Activity): View? {
+    private fun findTouchedVideoSurface(activity: Activity, event: MotionEvent): View? {
         val decor = activity.window?.decorView ?: return null
         val screenArea = activity.resources.displayMetrics.widthPixels.toLong() *
             activity.resources.displayMetrics.heightPixels.toLong()
         if (screenArea <= 0) return null
-        val minArea = (screenArea * 0.32).toLong()
-        var best: View? = null
-        var bestArea = 0L
+        val minArea = (screenArea * 0.18).toLong()
+        val hits = mutableListOf<Pair<View, Long>>()
+
+        fun isVideoLike(v: View): Boolean {
+            return v is SurfaceView || v is TextureView ||
+                v.javaClass.name.contains("PlayerView", ignoreCase = true)
+        }
 
         fun scan(v: View) {
-            if (v is SurfaceView || v is TextureView ||
-                v.javaClass.name.contains("PlayerView", ignoreCase = true)
-            ) {
+            if (v.isShown && isVideoLike(v) && v.width > 0 && v.height > 0) {
                 val area = v.width.toLong() * v.height.toLong()
-                if (area > bestArea) {
-                    bestArea = area
-                    best = v
+                if (area >= minArea && touchInside(v, event)) {
+                    hits.add(v to area)
                 }
             }
             if (v is ViewGroup) {
@@ -327,7 +316,9 @@ class MediaDownloadHook : BaseHook() {
             }
         }
         scan(decor)
-        return if (bestArea >= minArea) best else null
+        if (hits.isEmpty()) return null
+        // 同一触点上 PlayerView 包着 SurfaceView：取更小的那块，才能对上 setVideoSurfaceView。
+        return hits.minBy { it.second }.first
     }
 
     private fun touchInside(view: View, event: MotionEvent): Boolean {
@@ -345,7 +336,7 @@ class MediaDownloadHook : BaseHook() {
                 ClipboardManager::class.java, "setPrimaryClip", ClipData::class.java,
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        if (!isDownloadEnabled()) return
+                        if (!downloadEnabled) return
                         val clip = param.args[0] as? ClipData ?: return
                         if (clip.itemCount == 0) return
                         val text = clip.getItemAt(0).text?.toString() ?: return
@@ -370,24 +361,13 @@ class MediaDownloadHook : BaseHook() {
         }
     }
 
-    private fun showDownloadChooser(activity: Activity, tweetId: String? = null) {
+    private fun showDownloadChooser(
+        activity: Activity,
+        tweetId: String? = null,
+        videoView: View? = null
+    ) {
         if (activity.isFinishing) return
-        var items = MediaCache.resolve(tweetId)
-        val hls = ExoCacheProbe.findCurrentHls(activity, MediaCache.currentMediaId)
-        if (hls != null) {
-            val videoIdx = items.indexOfFirst { it.isVideo }
-            val existing = items.getOrNull(videoIdx)
-            val existingIsProgressive = existing != null && MediaExtractor.isProgressiveMp4Url(existing.url)
-            val existingRank = existing?.url?.let { HlsPlaylistParser.qualityRank(it) } ?: -1L
-            val hlsRank = HlsPlaylistParser.qualityRank(hls.url)
-            if (!existingIsProgressive && (videoIdx < 0 || hlsRank >= existingRank)) {
-                items = if (videoIdx < 0) {
-                    listOf(hls) + items
-                } else {
-                    items.toMutableList().also { it[videoIdx] = hls }
-                }
-            }
-        }
+        val items = DownloadResolver.resolve(activity, tweetId, videoView)
         if (items.isEmpty()) {
             AlertDialog.Builder(activity)
                 .setTitle("📥 下载推文媒体")
@@ -401,22 +381,30 @@ class MediaDownloadHook : BaseHook() {
             return
         }
 
-        val labels = items.map { media ->
+        // 混合帖子（视频+多图同推文）：第一项“全部下载”，之后逐项列出
+        val labels = mutableListOf<String>()
+        labels.add("📥 全部下载（${items.size} 项）")
+        items.forEach { media ->
             if (media.isVideo) {
-                if (MediaExtractor.isHlsPlaylistUrl(media.url)) "📥 合成下载最高清视频"
+                if (MediaExtractor.isHlsPlaylistUrl(media.url)) labels.add("📥 合成下载最高清视频")
                 else {
                     val kbps = if (media.bitrate > 0) " ${media.bitrate / 1000}kbps" else ""
-                    "📥 视频$kbps"
+                    labels.add("📥 视频$kbps")
                 }
             } else {
-                "🖼️ 原图"
+                labels.add("🖼️ 原图")
             }
-        }.toTypedArray()
+        }
 
         AlertDialog.Builder(activity)
             .setTitle("📥 下载媒体")
-            .setItems(labels) { _, which ->
-                items.getOrNull(which)?.let { confirmDownload(activity, it) }
+            .setItems(labels.toTypedArray()) { _, which ->
+                if (which == 0) {
+                    // 全部下载：每项独立通知、互不阻塞
+                    items.forEach { Downloader.download(activity, it) }
+                } else {
+                    items.getOrNull(which - 1)?.let { confirmDownload(activity, it) }
+                }
             }
             .setNegativeButton("取消", null)
             .show()

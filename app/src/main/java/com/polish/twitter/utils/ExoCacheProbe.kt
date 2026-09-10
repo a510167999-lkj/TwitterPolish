@@ -27,10 +27,12 @@ object ExoCacheProbe {
         val recentMediaId = keys.asReversed().asSequence().mapNotNull { MediaExtractor.extractMediaId(it) }.firstOrNull()
         val mediaId = preferredMediaId?.takeIf { it.isNotBlank() } ?: recentMediaId
         val scoped = if (mediaId != null) {
-            keys.filter { MediaExtractor.extractMediaId(it) == mediaId }.ifEmpty { keys }
+            // 已知正在播放的 id 时绝不能 fallback 到其它视频的 cache（上一条仍在缓冲）。
+            keys.filter { MediaExtractor.extractMediaId(it) == mediaId }
         } else {
             keys
         }
+        if (scoped.isEmpty()) return null
 
         var master: String? = null
         var bestVideo: String? = null

@@ -241,4 +241,62 @@ class TimelineProcessorTest {
         assertEquals("5000", tweet1.getString("sortIndex"))
         assertEquals("4000", tweet2.getString("sortIndex"))
     }
+
+    @Test
+    fun consecutivePinnedAdsAreAllRemoved() {
+        // 回归 P1-3：删除元素时索引后移导致“跳过下一个”，连续广告必须全部被移除
+        val rawJson = """
+        {
+          "instructions": [
+            { "type": "TimelinePinEntry", "entry": { "entryId": "promoted-tweet-1", "content": {} } },
+            { "type": "TimelinePinEntry", "entry": { "entryId": "promoted-tweet-2", "content": {} } },
+            {
+              "type": "TimelineAddEntries",
+              "entries": [
+                {
+                  "entryId": "tweet-1700000000000000000",
+                  "content": {
+                    "entryType": "TimelineTimelineItem",
+                    "itemContent": {
+                      "itemType": "TimelineTweet",
+                      "tweet_results": { "result": { "rest_id": "1700000000000000000" } }
+                    }
+                  }
+                }
+              ]
+            },
+            { "type": "TimelinePinEntry", "entry": { "entryId": "promoted-tweet-3", "content": {} } }
+          ]
+        }
+        """.trimIndent()
+
+        val processed = TimelineProcessor.processTimelineResponse(rawJson)
+        val instructions = JSONObject(processed).getJSONArray("instructions")
+        assertEquals(
+            "三条连续的 promoted PinEntry 应全部删除，只保留真实推文 instruction",
+            1,
+            instructions.length()
+        )
+        assertEquals("TimelineAddEntries", instructions.getJSONObject(0).getString("type"))
+    }
+
+    @Test
+    fun noRewriteWhenNothingToStripAndSortDisabled() {
+        // WHY: 网络层会 bytes() 耗尽响应体。无广告且关闭时间序时必须返回同一字符串实例，
+        // 这样拦截器走 restoreOriginal（原字节重建），而不是 JSONObject.toString() 改 key 序。
+        // 若这里仍改写，改写失败就会把已消耗的 body 交回客户端，下拉刷新一直转。
+        val raw = """{"instructions":[{"type":"TimelineAddEntries","entries":[""" +
+            """{"entryId":"tweet-1700000000000000000","content":{"entryType":"TimelineTimelineItem",""" +
+            """"itemContent":{"tweet_results":{"result":{"rest_id":"1700000000000000000"}}}}},""" +
+            """{"entryId":"cursor-bottom-1","content":{"entryType":"TimelineTimelineCursor","cursorType":"Bottom"}}]}]}"""
+        val out = TimelineProcessor.processTimelineResponse(
+            raw,
+            enableAdBlock = true,
+            enableChronoSort = false
+        )
+        assertTrue(
+            "无广告且关闭排序时应返回原字符串实例，避免无意义改写",
+            out === raw
+        )
+    }
 }

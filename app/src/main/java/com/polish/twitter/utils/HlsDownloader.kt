@@ -103,8 +103,13 @@ object HlsDownloader {
                 aOut = muxer.addTrack(audioEx.getTrackFormat(aTrack))
             }
             muxer.start()
-            copySamples(videoEx, muxer, vOut)
-            if (aOut >= 0) copySamples(audioEx, muxer, aOut)
+            // 按 PTS 交错写入两路样本：先写满一个轨道再写另一个会使部分设备
+            // MediaMuxer 失败或生成音画不同步文件
+            if (aOut >= 0) {
+                copySamplesInterleaved(videoEx, vOut, audioEx, aOut, muxer)
+            } else {
+                copySamples(videoEx, muxer, vOut)
+            }
             muxer.stop()
         } finally {
             try { videoEx.release() } catch (_: Throwable) {}
@@ -121,6 +126,7 @@ object HlsDownloader {
         return if (extractor.trackCount > 0 && mimePrefix.startsWith("video")) 0 else -1
     }
 
+    /** 单轨直写（无音频时使用）。 */
     private fun copySamples(extractor: MediaExtractor, muxer: MediaMuxer, trackIndex: Int) {
         val buffer = ByteBuffer.allocate(1024 * 1024)
         val info = MediaCodec.BufferInfo()
@@ -132,6 +138,65 @@ object HlsDownloader {
             info.presentationTimeUs = extractor.sampleTime.coerceAtLeast(0L)
             info.flags = extractor.sampleFlags
             muxer.writeSampleData(trackIndex, buffer, info)
+            extractor.advance()
+        }
+    }
+
+    /** 两个抽取器各持独立 buffer/info，按 PTS 取小者写入，直到双轨耗尽。 */
+    private fun copySamplesInterleaved(
+        videoEx: MediaExtractor,
+        vOut: Int,
+        audioEx: MediaExtractor,
+        aOut: Int,
+        muxer: MediaMuxer
+    ) {
+        val v = TrackState(videoEx, muxer, vOut)
+        val a = TrackState(audioEx, muxer, aOut)
+        while (true) {
+            val vReady = v.ensure()
+            val aReady = a.ensure()
+            if (!vReady && !aReady) break
+            when {
+                !vReady -> a.write()
+                !aReady -> v.write()
+                v.info.presentationTimeUs <= a.info.presentationTimeUs -> v.write()
+                else -> a.write()
+            }
+        }
+    }
+
+    /** 单个抽取器的读取状态（保留下一待写样本）。 */
+    private class TrackState(
+        private val extractor: MediaExtractor,
+        private val muxer: MediaMuxer,
+        private val trackIndex: Int
+    ) {
+        val buffer = ByteBuffer.allocate(1024 * 1024)
+        val info = MediaCodec.BufferInfo()
+        private var hasPending = false
+        private var done = false
+
+        /** 确保有一份未写入的样本；返回 false 表示该轨已耗尽。 */
+        fun ensure(): Boolean {
+            if (done) return false
+            if (!hasPending) {
+                val size = extractor.readSampleData(buffer, 0)
+                if (size < 0) {
+                    done = true
+                    return false
+                }
+                info.offset = 0
+                info.size = size
+                info.presentationTimeUs = extractor.sampleTime.coerceAtLeast(0L)
+                info.flags = extractor.sampleFlags
+                hasPending = true
+            }
+            return true
+        }
+
+        fun write() {
+            muxer.writeSampleData(trackIndex, buffer, info)
+            hasPending = false
             extractor.advance()
         }
     }
@@ -156,15 +221,22 @@ object HlsDownloader {
     private data class Opened(val stream: java.io.InputStream, val close: () -> Unit)
 
     private fun open(url: String): Opened {
+        if (DownloadSecurity.isBlockedHost(url)) {
+            throw RuntimeException("Blocked host in HLS: $url")
+        }
         val via = HostOkHttp.open(url)
         if (via != null) return Opened(via.stream, via.close)
+        val trusted = DownloadSecurity.mayAttachCredentials(url)
         val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
         conn.instanceFollowRedirects = true
         conn.connectTimeout = 20000
         conn.readTimeout = 60000
         conn.setRequestProperty("User-Agent", "Mozilla/5.0")
-        conn.setRequestProperty("Referer", "https://x.com/")
-        conn.setRequestProperty("Origin", "https://x.com")
+        // 匿名路径：仅可信媒体域名附带站内 Referer/Origin
+        if (trusted) {
+            conn.setRequestProperty("Referer", "https://x.com/")
+            conn.setRequestProperty("Origin", "https://x.com")
+        }
         conn.connect()
         if (conn.responseCode !in 200..299) {
             conn.disconnect()

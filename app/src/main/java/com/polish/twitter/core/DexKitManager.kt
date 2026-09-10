@@ -17,11 +17,14 @@ object DexKitManager {
     const val KEY_OKHTTP_CLIENT_BUILD = "okhttp_client_build"
     const val KEY_ACTION_SHEET_SHOW = "action_sheet_show"
     const val KEY_TIMELINE_ITEM_IS_PROMOTED = "timeline_item_is_promoted"
+    const val KEY_EXOPLAYER_IMPL = "exoplayer_impl"
+    private const val DEXKIT_SCHEMA = 2
+    private const val KEY_DEXKIT_SCHEMA = "dexkit_schema"
 
     /**
      * 初始化 DexKit 并加载/更新符号缓存
      */
-    fun init(context: Context, classLoader: ClassLoader) {
+    fun init(context: Context) {
         if (isInitialized) return
 
         try {
@@ -31,10 +34,14 @@ object DexKitManager {
             val prefs = context.getSharedPreferences(Constants.PREFS_NAME, Context.MODE_PRIVATE)
             val cachedVersionCode = prefs.getLong(Constants.KEY_CACHED_VERSION_CODE, -1L)
             val cachedJson = prefs.getString(Constants.KEY_DEXKIT_CACHE, null)
+            val cachedSchema = prefs.getInt(KEY_DEXKIT_SCHEMA, 0)
 
-            if (currentVersionCode == cachedVersionCode && !cachedJson.isNullOrBlank()) {
+            if (currentVersionCode == cachedVersionCode &&
+                cachedSchema == DEXKIT_SCHEMA &&
+                !cachedJson.isNullOrBlank()
+            ) {
                 // 命中缓存，直接载入已解析的混淆类名与方法签名
-                Logger.i("DexKit cache hit for version: $currentVersionCode")
+                Logger.i("DexKit cache hit for version: $currentVersionCode schema=$DEXKIT_SCHEMA")
                 loadCacheFromJson(cachedJson)
                 isInitialized = true
                 return
@@ -45,25 +52,27 @@ object DexKitManager {
             val apkPath = context.applicationInfo.sourceDir
 
             System.loadLibrary("dexkit")
-            DexKitBridge.create(apkPath)?.use { bridge ->
-                scanSymbols(bridge, classLoader)
+            val bridge: DexKitBridge? = DexKitBridge.create(apkPath)
+            bridge?.use { scanSymbols(it) }
+
+            if (cacheMap.isEmpty()) {
+                Logger.e("DexKit scan produced no symbols — dependent hooks will be inactive until next cold start")
+            } else {
+                val newJson = JSONObject(cacheMap as Map<*, *>).toString()
+                prefs.edit()
+                    .putLong(Constants.KEY_CACHED_VERSION_CODE, currentVersionCode)
+                    .putString(Constants.KEY_DEXKIT_CACHE, newJson)
+                    .putInt(KEY_DEXKIT_SCHEMA, DEXKIT_SCHEMA)
+                    .apply()
+                Logger.i("DexKit symbol scan completed and cached successfully.")
             }
-
-            // 将新解析的结果持久化至本地
-            val newJson = JSONObject(cacheMap as Map<*, *>).toString()
-            prefs.edit()
-                .putLong(Constants.KEY_CACHED_VERSION_CODE, currentVersionCode)
-                .putString(Constants.KEY_DEXKIT_CACHE, newJson)
-                .apply()
-
-            Logger.i("DexKit symbol scan completed and cached successfully.")
             isInitialized = true
         } catch (e: Throwable) {
             Logger.e("DexKit initialization error", e)
         }
     }
 
-    private fun scanSymbols(bridge: DexKitBridge, classLoader: ClassLoader) {
+    private fun scanSymbols(bridge: DexKitBridge) {
         try {
             // 1. 检索 OkHttpClient.Builder.build() 方法
             val okhttpBuildMethod = bridge.findMethod {
@@ -99,6 +108,19 @@ object DexKitManager {
             actionSheetMethods.firstOrNull()?.let {
                 cacheMap[KEY_ACTION_SHEET_SHOW] = "${it.className}#${it.name}"
                 Logger.d("Found ActionSheet method: ${cacheMap[KEY_ACTION_SHEET_SHOW]}")
+            }
+
+            val exoImplMethods = bridge.findMethod {
+                matcher {
+                    usingStrings("ExoPlayerImpl")
+                }
+            }
+            val exoImpl = exoImplMethods.firstOrNull {
+                it.className.contains("exoplayer", ignoreCase = true)
+            } ?: exoImplMethods.firstOrNull()
+            exoImpl?.let {
+                cacheMap[KEY_EXOPLAYER_IMPL] = "${it.className}#${it.name}"
+                Logger.d("Found ExoPlayerImpl: ${cacheMap[KEY_EXOPLAYER_IMPL]}")
             }
         } catch (e: Throwable) {
             Logger.w("Error during DexKit bytecode scan", e)

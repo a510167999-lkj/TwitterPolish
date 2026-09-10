@@ -1,9 +1,13 @@
 package com.polish.twitter
 
+import com.polish.twitter.processor.ExtractedMedia
 import com.polish.twitter.processor.HlsPlaylistParser
+import com.polish.twitter.processor.MediaExtractor
+import com.polish.twitter.utils.DownloadResolver
 import com.polish.twitter.utils.ExoCacheProbe
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -37,6 +41,12 @@ class HlsPlaylistParserTest {
         assertTrue(
             HlsPlaylistParser.isMasterPlaylistUrl(
                 "https://video.twimg.com/amplify_video/1/pl/Q1z5fx0TWVid4Wit.m3u8?tag=21"
+            )
+        )
+        assertTrue(
+            "GraphQL x-mpegURL is master even without /pl/{token}.m3u8",
+            HlsPlaylistParser.isMasterPlaylistUrl(
+                "https://video.twimg.com/vid/playlist.m3u8"
             )
         )
         assertFalse(
@@ -105,5 +115,80 @@ class HlsPlaylistParserTest {
         val picked = ExoCacheProbe.pickFromKeys(keys)!!
         assertTrue(picked.url.contains("/pl/avc1/720x1280/"))
         assertTrue(picked.hlsAudioUrl.contains("/pl/mp4a/128000/"))
+    }
+
+    @Test
+    fun exoCacheMustNotFallBackToAnotherVideoWhenPreferredIdHasNoKeys() {
+        val keys = listOf(
+            "https://video.twimg.com/amplify_video/1111111111111111111/pl/oldMaster.m3u8?tag=21",
+            "https://video.twimg.com/amplify_video/1111111111111111111/pl/avc1/720x1280/old.m3u8"
+        )
+        assertNull(
+            "Previous video still in Exo cache must not be saved for a different playing id",
+            ExoCacheProbe.pickFromKeys(keys, "2222222222222222222")
+        )
+    }
+
+    @Test
+    fun downloadResolverUpgradesProgressiveToHlsMasterOfTheSameVideo() {
+        val progressive = ExtractedMedia(
+            url = "https://video.twimg.com/amplify_video/2093578924810960896/vid/720x1280/full.mp4",
+            isVideo = true,
+            fileName = "twitter_a_video.mp4",
+            bitrate = 2176000,
+            tweetId = "2056623384482783650",
+            mediaId = "2093578924810960896"
+        )
+        val hls = ExtractedMedia(
+            url = "https://video.twimg.com/amplify_video/2093578924810960896/pl/Q1z5fx0TWVid4Wit.m3u8?tag=21",
+            isVideo = true,
+            fileName = "twitter_hls.mp4",
+            mediaId = "2093578924810960896"
+        )
+        val merged = DownloadResolver.merge(listOf(progressive), hls, "2093578924810960896")
+        assertEquals(1, merged.size)
+        assertTrue(
+            "Chooser must not keep 720p progressive when master is available",
+            HlsPlaylistParser.isMasterPlaylistUrl(merged[0].url)
+        )
+        assertEquals("2056623384482783650", merged[0].tweetId)
+    }
+
+    @Test
+    fun downloadResolverDoesNotReplaceWithADifferentVideosHls() {
+        val current = ExtractedMedia(
+            url = "https://video.twimg.com/amplify_video/1000000000000000002/pl/masterB.m3u8",
+            isVideo = true,
+            fileName = "b.mp4",
+            mediaId = "1000000000000000002"
+        )
+        val staleHls = ExtractedMedia(
+            url = "https://video.twimg.com/amplify_video/1000000000000000001/pl/masterA.m3u8",
+            isVideo = true,
+            fileName = "a.mp4",
+            mediaId = "1000000000000000001"
+        )
+        val merged = DownloadResolver.merge(listOf(current), staleHls, "1000000000000000002")
+        assertEquals(
+            "Stale Exo cache of the previous clip must not replace the playing video",
+            current.url,
+            merged.single().url
+        )
+    }
+
+    @Test
+    fun downloadQualityRanksMasterAboveProgressive() {
+        val master = ExtractedMedia(
+            url = "https://video.twimg.com/amplify_video/1/pl/token.m3u8",
+            isVideo = true,
+            fileName = "m.mp4"
+        )
+        val progressive = ExtractedMedia(
+            url = "https://video.twimg.com/amplify_video/1/vid/1280x720/full.mp4",
+            isVideo = true,
+            fileName = "p.mp4",
+            bitrate = 2176000
+        )
+        assertTrue(MediaExtractor.downloadQuality(master) > MediaExtractor.downloadQuality(progressive))
     }
 }

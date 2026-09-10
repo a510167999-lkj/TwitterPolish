@@ -58,6 +58,12 @@ object HostOkHttp {
     }
 
     fun open(url: String): OpenedStream? {
+        // 安全边界：宿主 OkHttpClient 可能由认证拦截器自动附加 Authorization，
+        // 因此仅允许携带凭证访问白名单媒体域名，其余一律返回 null 走匿名回退。
+        if (!DownloadSecurity.mayAttachCredentials(url)) {
+            Logger.d("HostOkHttp refused (untrusted host): $url")
+            return null
+        }
         val okClient = client ?: return null
         return try {
             val loader = okClient.javaClass.classLoader ?: return null

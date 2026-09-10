@@ -2,8 +2,8 @@ package com.polish.twitter.hooks
 
 import android.app.Activity
 import android.content.Context
-import android.os.Bundle
 import com.polish.twitter.core.Logger
+import com.polish.twitter.core.XHost
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 
@@ -20,14 +20,7 @@ class TabSwitcherHook : BaseHook() {
     }
 
     private fun hookMainActivity(classLoader: ClassLoader) {
-        val candidateActivities = listOf(
-            "com.x.android.main.MainActivity",
-            "com.twitter.app.main.MainActivity",
-            "com.twitter.android.MainActivity",
-            "com.twitter.android.HomeTimelineActivity"
-        )
-
-        for (activityName in candidateActivities) {
+        for (activityName in XHost.MAIN_ACTIVITY_CANDIDATES) {
             try {
                 val activityClass = classLoader.loadClass(activityName)
                 XposedBridge.hookAllMethods(activityClass, "onCreate", object : XC_MethodHook() {

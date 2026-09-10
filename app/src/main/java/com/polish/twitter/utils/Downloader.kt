@@ -52,6 +52,11 @@ object Downloader {
             showToast(context, "❌ 下载链接无效")
             return
         }
+        if (DownloadSecurity.isBlockedHost(cleanUrl)) {
+            Logger.w("Refusing download to blocked host: $cleanUrl")
+            showToast(context, "❌ 下载链接不安全，已拦截")
+            return
+        }
         if (MediaExtractor.isHlsPlaylistUrl(cleanUrl)) {
             showToast(context, "📥 正在从播放流合成完整视频…")
             Logger.i("HLS download requested: $cleanUrl audio=$hlsAudioUrl")
@@ -137,6 +142,8 @@ object Downloader {
             }
 
             val buffer = ByteArray(16 * 1024)
+            // 打开输出流后立即转局部变量，全程使用局部引用（此处经流程分析已保证非空）
+            val out = outputStream
             var bytesRead: Int
             var totalRead = 0L
             var lastNotifyMs = 0L
@@ -158,7 +165,7 @@ object Downloader {
                         headerChecked = true
                     }
                 }
-                outputStream!!.write(buffer, 0, bytesRead)
+                out.write(buffer, 0, bytesRead)
                 totalRead += bytesRead
 
                 val now = System.currentTimeMillis()
@@ -181,9 +188,8 @@ object Downloader {
                 throw RuntimeException("只下到 ${totalRead}B，不是完整视频")
             }
 
-            outputStream!!.flush()
-            outputStream.close()
-            outputStream = null
+            out.flush()
+            out.close()
             inputStream.close()
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && outputUri != null) {
@@ -346,13 +352,18 @@ object Downloader {
     )
 
     private fun openSource(downloadUrl: String): Source {
-        val viaOkHttp = HostOkHttp.open(downloadUrl)
-        if (viaOkHttp != null) {
-            Logger.i("Downloading via host OkHttp, length=${viaOkHttp.contentLength}")
-            return Source(viaOkHttp.stream, viaOkHttp.contentLength, viaOkHttp, null)
+        // 仅白名单域名允许携带宿主凭证（Cookie/Authorization）走宿主 OkHttp；
+        // 其余域名一律匿名连接，防止用户 Twitter 凭证外泄到第三方域。
+        val trusted = DownloadSecurity.mayAttachCredentials(downloadUrl)
+        if (trusted) {
+            val viaOkHttp = HostOkHttp.open(downloadUrl)
+            if (viaOkHttp != null) {
+                Logger.i("Downloading via host OkHttp, length=${viaOkHttp.contentLength}")
+                return Source(viaOkHttp.stream, viaOkHttp.contentLength, viaOkHttp, null)
+            }
         }
 
-        Logger.i("Host OkHttp unavailable, falling back to HttpURLConnection")
+        Logger.i("Host OkHttp unavailable or untrusted host, falling back to anonymous HttpURLConnection")
         val url = URL(downloadUrl)
         val connection = url.openConnection() as HttpURLConnection
         connection.instanceFollowRedirects = true
@@ -362,11 +373,14 @@ object Downloader {
             "User-Agent",
             "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
         )
-        connection.setRequestProperty("Referer", "https://x.com/")
-        connection.setRequestProperty("Origin", "https://x.com")
         connection.setRequestProperty("Accept", "video/mp4,image/jpeg,image/*,*/*;q=0.8")
         connection.setRequestProperty("Accept-Encoding", "identity")
-        HostOkHttp.cookie?.let { connection.setRequestProperty("Cookie", it) }
+        // 匿名路径不带 Cookie；仅对可信媒体域名附加站内 Referer/Origin
+        if (trusted) {
+            connection.setRequestProperty("Referer", "https://x.com/")
+            connection.setRequestProperty("Origin", "https://x.com")
+            HostOkHttp.cookie?.let { connection.setRequestProperty("Cookie", it) }
+        }
         connection.connect()
 
         val responseCode = connection.responseCode

@@ -15,30 +15,53 @@ import android.widget.TextView
 import android.widget.Toast
 import com.polish.twitter.core.Constants
 import com.polish.twitter.core.Logger
-import com.polish.twitter.processor.MediaCache
+import com.polish.twitter.utils.DownloadResolver
 import com.polish.twitter.utils.Downloader
-import com.polish.twitter.utils.ExoCacheProbe
 
 object FloatingMenuManager {
 
-    private const val PREF_SHOW_FLOATING_BALL = "show_floating_ball"
-    private var currentFloatingView: View? = null
+    /**
+     * 按 Activity 弱引用跟踪已挂载的悬浮球：
+     * 解决原先单引用下 Activity 旋转/重建后悬浮球脱离管理、
+     * 新 Activity 上无法重新挂载的问题。
+     */
+    private val attachedByActivity = java.util.Collections.synchronizedMap(
+        java.util.WeakHashMap<Activity, View>()
+    )
 
     @SuppressLint("ClickableViewAccessibility")
     fun attach(activity: Activity) {
         if (activity.isFinishing || (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.JELLY_BEAN_MR1 && activity.isDestroyed)) return
 
         val prefs = activity.getSharedPreferences(Constants.PREFS_NAME, Context.MODE_PRIVATE)
-        val isEnabled = prefs.getBoolean(PREF_SHOW_FLOATING_BALL, true)
+        val isEnabled = prefs.getBoolean(Constants.PREF_SHOW_FLOATING_BALL, true)
         if (!isEnabled) {
             remove()
             return
         }
 
         val decorView = activity.window.decorView as? ViewGroup ?: return
-        if (currentFloatingView != null && currentFloatingView?.parent === decorView) {
+
+        // 清理已销毁/已卸载 Activity 上遗留的悬浮球，避免脏视图滞留
+        synchronized(attachedByActivity) {
+            val it = attachedByActivity.entries.iterator()
+            while (it.hasNext()) {
+                val (host, view) = it.next()
+                if (host !== activity &&
+                    (host.isFinishing || (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.JELLY_BEAN_MR1 && host.isDestroyed) || view.parent == null)
+                ) {
+                    (view.parent as? ViewGroup)?.removeView(view)
+                    it.remove()
+                }
+            }
+        }
+
+        val existing = attachedByActivity[activity]
+        if (existing != null && existing.parent === decorView && decorView.indexOfChild(existing) >= 0) {
             return
         }
+        // 同 Activity 再次挂载：先摘掉旧的（例如 decorView 重建后）
+        (existing?.parent as? ViewGroup)?.removeView(existing)
 
         val dp = activity.resources.displayMetrics.density
         val sizePx = (46 * dp).toInt()
@@ -114,40 +137,48 @@ object FloatingMenuManager {
 
         try {
             decorView.addView(floatingBtn, layoutParams)
-            currentFloatingView = floatingBtn
+            attachedByActivity[activity] = floatingBtn
             Logger.d("Attached draggable floating ball to decorView.")
         } catch (e: Throwable) {
             Logger.w("Failed to attach floating ball", e)
         }
     }
 
+    /** 移除所有 Activity 上的悬浮球（关闭开关 / 隐藏入口调用）。 */
     fun remove() {
-        try {
-            currentFloatingView?.let {
-                val parent = it.parent as? ViewGroup
-                parent?.removeView(it)
+        synchronized(attachedByActivity) {
+            val it = attachedByActivity.entries.iterator()
+            while (it.hasNext()) {
+                val (_, view) = it.next()
+                try {
+                    (view.parent as? ViewGroup)?.removeView(view)
+                } catch (_: Throwable) {
+                }
+                it.remove()
             }
-            currentFloatingView = null
-        } catch (_: Throwable) {}
+        }
     }
 
     private fun showQuickActionDialog(activity: Activity) {
         val options = mutableListOf<String>()
         val actions = mutableListOf<() -> Unit>()
 
-        val mediaItems = MediaCache.resolve().toMutableList()
-        if (mediaItems.none { it.isVideo }) {
-            ExoCacheProbe.findCurrentHls(activity, MediaCache.currentMediaId)?.let {
-                mediaItems.add(0, it)
-            }
-        }
+        val mediaItems = DownloadResolver.resolve(activity)
         val videos = mediaItems.filter { it.isVideo }
         val photos = mediaItems.filter { !it.isVideo }
 
-        if (videos.isNotEmpty()) {
-            options.add("📥 下载当前视频")
+        // 混合帖子：视频与图片逐项列出 + 全部下载
+        if (mediaItems.size > 1) {
+            options.add("📥 全部下载（${mediaItems.size} 项）")
             actions.add {
-                Downloader.download(activity, videos.first())
+                mediaItems.forEach { Downloader.download(activity, it) }
+            }
+        }
+
+        videos.forEachIndexed { index, video ->
+            options.add("📥 下载当前视频${if (videos.size > 1) " ${index + 1}" else ""}")
+            actions.add {
+                Downloader.download(activity, video)
             }
         }
 
@@ -166,7 +197,7 @@ object FloatingMenuManager {
         options.add("❌ 隐藏此悬浮球")
         actions.add {
             val prefs = activity.getSharedPreferences(Constants.PREFS_NAME, Context.MODE_PRIVATE)
-            prefs.edit().putBoolean(PREF_SHOW_FLOATING_BALL, false).apply()
+            prefs.edit().putBoolean(Constants.PREF_SHOW_FLOATING_BALL, false).apply()
             remove()
             Toast.makeText(activity, "悬浮球已隐藏，如需再次开启可长按顶部 X 进入设置", Toast.LENGTH_LONG).show()
         }

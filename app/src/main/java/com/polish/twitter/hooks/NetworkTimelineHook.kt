@@ -1,6 +1,7 @@
 package com.polish.twitter.hooks
 
 import android.content.Context
+import android.content.SharedPreferences
 import com.polish.twitter.core.Constants
 import com.polish.twitter.core.DexKitManager
 import com.polish.twitter.core.Logger
@@ -17,21 +18,56 @@ import java.lang.reflect.InvocationHandler
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
 import java.lang.reflect.Proxy
+import java.util.Collections
+import java.util.WeakHashMap
 import java.util.zip.GZIPInputStream
 import java.util.zip.GZIPOutputStream
 
 class NetworkTimelineHook : BaseHook() {
 
     override val name: String = "NetworkTimelineHook"
-    private var appContext: Context? = null
+
+    @Volatile
+    private var enableAdBlock = true
+
+    @Volatile
+    private var enableChronoSort = true
+
+    // SharedPreferences 对 listener 只持 WeakReference，必须自己留强引用。
+    private var prefsListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
+
+    // 拦截器与 RealCall.afterHook 会看到同一条响应；重建后的实例记在这里，避免二次 bytes()。
+    private val processedResponses = Collections.synchronizedMap(WeakHashMap<Any, Boolean>())
 
     override fun init(classLoader: ClassLoader, context: Context) {
-        this.appContext = context
+        try {
+            refreshSettings(context)
+            val prefs = context.getSharedPreferences(Constants.PREFS_NAME, Context.MODE_PRIVATE)
+            val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+                if (key == Constants.PREF_ENABLE_AD_BLOCK || key == Constants.PREF_ENABLE_CHRONO_SORT) {
+                    refreshSettings(context)
+                }
+            }
+            prefsListener = listener
+            prefs.registerOnSharedPreferenceChangeListener(listener)
+        } catch (t: Throwable) {
+            Logger.w("Failed to init settings snapshot for NetworkTimelineHook", t)
+        }
+
         try {
             hookOkHttp(classLoader)
             hookRealCall(classLoader)
         } catch (e: Throwable) {
             Logger.e("Failed to hook OkHttp network layer", e)
+        }
+    }
+
+    private fun refreshSettings(context: Context) {
+        try {
+            val prefs = context.getSharedPreferences(Constants.PREFS_NAME, Context.MODE_PRIVATE)
+            enableAdBlock = prefs.getBoolean(Constants.PREF_ENABLE_AD_BLOCK, true)
+            enableChronoSort = prefs.getBoolean(Constants.PREF_ENABLE_CHRONO_SORT, true)
+        } catch (_: Throwable) {
         }
     }
 
@@ -52,6 +88,7 @@ class NetworkTimelineHook : BaseHook() {
 
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val resp = param.result ?: return
+                    if (processedResponses.containsKey(resp)) return
                     try {
                         val modified = processResponseDirectly(resp, classLoader)
                         if (modified != null) {
@@ -96,25 +133,32 @@ class NetworkTimelineHook : BaseHook() {
                 arrayOf(interceptorClass),
                 object : InvocationHandler {
                     override fun invoke(proxy: Any?, method: Method?, args: Array<out Any>?): Any? {
-                        if (method?.name == "intercept" && args != null && args.isNotEmpty()) {
-                            val chain = args[0]
-                            return handleIntercept(chain, classLoader)
+                        if (method == null) return null
+                        when (method.name) {
+                            "intercept" -> {
+                                if (args != null && args.isNotEmpty()) {
+                                    return handleIntercept(args[0], classLoader)
+                                }
+                                return null
+                            }
+                            "equals" -> return proxy === args?.getOrNull(0)
+                            "hashCode" -> return System.identityHashCode(proxy)
+                            "toString" -> return "TwitterPolishTimelineInterceptor"
                         }
-                        return method?.invoke(proxy, *(args ?: emptyArray()))
+                        return defaultValue(method.returnType)
                     }
                 }
             )
 
             if (okHttpBuilderClass != null) {
+                @Suppress("UNCHECKED_CAST")
                 XposedBridge.hookAllMethods(okHttpBuilderClass, "build", object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         try {
                             val builder = param.thisObject
                             val interceptors = XposedHelpers.getObjectField(builder, "interceptors") as? MutableList<Any>
                             if (interceptors != null) {
-                                val alreadyHas = interceptors.any {
-                                    it === timelineInterceptor || Proxy.isProxyClass(it.javaClass)
-                                }
+                                val alreadyHas = interceptors.any { it === timelineInterceptor }
                                 if (!alreadyHas) {
                                     interceptors.add(0, timelineInterceptor)
                                     Logger.d("Added timelineInterceptor to OkHttpClient.Builder at index 0.")
@@ -131,12 +175,13 @@ class NetworkTimelineHook : BaseHook() {
 
             try {
                 val okHttpClientClass = classLoader.loadClass("okhttp3.OkHttpClient")
+                @Suppress("UNCHECKED_CAST")
                 XposedBridge.hookAllConstructors(okHttpClientClass, object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val builder = param.args.getOrNull(0) ?: return
                         try {
                             val interceptors = XposedHelpers.getObjectField(builder, "interceptors") as? MutableList<Any>
-                            if (interceptors != null && !interceptors.any { it === timelineInterceptor || Proxy.isProxyClass(it.javaClass) }) {
+                            if (interceptors != null && !interceptors.any { it === timelineInterceptor }) {
                                 interceptors.add(0, timelineInterceptor)
                                 Logger.d("Injected timelineInterceptor in OkHttpClient constructor.")
                             }
@@ -147,6 +192,16 @@ class NetworkTimelineHook : BaseHook() {
         }
 
         Logger.i("NetworkTimelineHook initialized successfully.")
+    }
+
+    private fun defaultValue(type: Class<*>): Any? {
+        return when (type) {
+            Void.TYPE, Void::class.java -> null
+            java.lang.Boolean.TYPE -> false
+            java.lang.Integer.TYPE -> 0
+            java.lang.Long.TYPE -> 0L
+            else -> null
+        }
     }
 
     private fun handleIntercept(chain: Any, classLoader: ClassLoader): Any {
@@ -165,11 +220,20 @@ class NetworkTimelineHook : BaseHook() {
             throw t
         }
 
+        if (processedResponses.containsKey(response)) {
+            return response
+        }
         val modified = processResponseDirectly(response, classLoader)
         return modified ?: response
     }
 
+    /**
+     * 读过 [okhttp3.ResponseBody.bytes] 之后原 body 不可再读。
+     * 唯一安全出口是重建 ResponseBody；禁止把已消耗的原响应交回调用方。
+     */
     private fun processResponseDirectly(response: Any, classLoader: ClassLoader): Any? {
+        if (processedResponses.containsKey(response)) return null
+
         val request = try {
             XposedHelpers.callMethod(response, "request")
         } catch (_: Throwable) { null } ?: return null
@@ -179,52 +243,52 @@ class NetworkTimelineHook : BaseHook() {
             urlObj.toString()
         } catch (_: Throwable) { "" }
 
-        val isTimelineRequest = urlString.contains("graphql", ignoreCase = true) ||
-                urlString.contains("timeline", ignoreCase = true) ||
-                urlString.contains("/2/", ignoreCase = true) ||
-                urlString.contains("/1.1/", ignoreCase = true)
+        if (!Constants.isTimelineApiUrl(urlString)) {
+            return null
+        }
 
-        if (!isTimelineRequest) {
+        if (!enableAdBlock && !enableChronoSort) {
             return null
         }
 
         Logger.d("Inspecting potential timeline API: $urlString")
 
+        val body = try {
+            XposedHelpers.callMethod(response, "body")
+        } catch (_: Throwable) { null } ?: return null
+
+        val contentType = try {
+            XposedHelpers.callMethod(body, "contentType")
+        } catch (_: Throwable) { null }
+
+        if (shouldSkipContentType(contentType?.toString())) {
+            return null
+        }
+
+        val contentEncoding = try {
+            XposedHelpers.callMethod(response, "header", "Content-Encoding") as? String
+        } catch (_: Throwable) { null }
+        val isGzip = contentEncoding?.equals("gzip", ignoreCase = true) == true
+
+        var rawBytes: ByteArray? = null
         try {
-            val ctx = appContext
-            var enableAdBlock = true
-            var enableChronoSort = true
-
-            if (ctx != null) {
-                val prefs = ctx.getSharedPreferences(Constants.PREFS_NAME, Context.MODE_PRIVATE)
-                enableAdBlock = prefs.getBoolean(Constants.PREF_ENABLE_AD_BLOCK, true)
-                enableChronoSort = prefs.getBoolean(Constants.PREF_ENABLE_CHRONO_SORT, true)
-            }
-
-            if (!enableAdBlock && !enableChronoSort) {
-                return null
-            }
-
-            val body = XposedHelpers.callMethod(response, "body") ?: return null
-            val contentType = XposedHelpers.callMethod(body, "contentType")
-
-            val contentEncoding = try {
-                XposedHelpers.callMethod(response, "header", "Content-Encoding") as? String
-            } catch (_: Throwable) { null }
-
-            val isGzip = contentEncoding?.equals("gzip", ignoreCase = true) == true
-
-            val rawBytes = XposedHelpers.callMethod(body, "bytes") as? ByteArray ?: return null
+            rawBytes = XposedHelpers.callMethod(body, "bytes") as? ByteArray
+            val bytes = rawBytes ?: return null
 
             val rawJson = if (isGzip) {
                 try {
-                    decompressGzip(rawBytes)
+                    decompressGzip(bytes)
                 } catch (e: Throwable) {
-                    Logger.w("Failed to decompress GZIP response, trying raw string", e)
-                    String(rawBytes, Charsets.UTF_8)
+                    Logger.w("Failed to decompress GZIP response, restoring original bytes", e)
+                    return rebuildResponse(response, classLoader, contentType, bytes, contentEncoding)
                 }
             } else {
-                String(rawBytes, Charsets.UTF_8)
+                String(bytes, Charsets.UTF_8)
+            }
+
+            val trimmed = rawJson.trimStart()
+            if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+                return rebuildResponse(response, classLoader, contentType, bytes, contentEncoding)
             }
 
             try {
@@ -240,32 +304,65 @@ class NetworkTimelineHook : BaseHook() {
             )
 
             if (processedJson == rawJson) {
-                val responseBodyClass = classLoader.loadClass("okhttp3.ResponseBody")
-                val untouchedBody = createResponseBody(responseBodyClass, contentType, rawBytes) ?: return null
-                val newBuilder = XposedHelpers.callMethod(response, "newBuilder")
-                XposedHelpers.callMethod(newBuilder, "body", untouchedBody)
-                return XposedHelpers.callMethod(newBuilder, "build")
+                return rebuildResponse(response, classLoader, contentType, bytes, contentEncoding)
             }
 
             Logger.i("Purified and chronologically ordered timeline: $urlString")
-
-            val responseBodyClass = classLoader.loadClass("okhttp3.ResponseBody")
-            val newBuilder = XposedHelpers.callMethod(response, "newBuilder")
-
-            val newBody = if (isGzip) {
-                val compressedBytes = compressGzip(processedJson)
-                createResponseBody(responseBodyClass, contentType, compressedBytes)
+            val outBytes = if (isGzip) {
+                compressGzip(processedJson)
             } else {
-                val utf8Bytes = processedJson.toByteArray(Charsets.UTF_8)
-                createResponseBody(responseBodyClass, contentType, utf8Bytes)
+                processedJson.toByteArray(Charsets.UTF_8)
             }
-
-            XposedHelpers.callMethod(newBuilder, "body", newBody)
-            return XposedHelpers.callMethod(newBuilder, "build")
-
+            val outEncoding = if (isGzip) "gzip" else null
+            return rebuildResponse(response, classLoader, contentType, outBytes, outEncoding)
         } catch (e: Throwable) {
             Logger.e("Error processing timeline response: ${e.message}", e)
+            val fallback = rawBytes
+            if (fallback != null) {
+                return rebuildResponse(response, classLoader, contentType, fallback, contentEncoding)
+            }
             return null
+        }
+    }
+
+    private fun shouldSkipContentType(typeStr: String?): Boolean {
+        if (typeStr.isNullOrBlank()) return false
+        val t = typeStr.lowercase()
+        if (t.contains("json") || t.contains("text") || t.contains("javascript")) return false
+        return t.contains("image") || t.contains("video") || t.contains("audio") ||
+            t.contains("octet-stream") || t.contains("mpegurl") || t.contains("protobuf")
+    }
+
+    private fun rebuildResponse(
+        response: Any,
+        classLoader: ClassLoader,
+        contentType: Any?,
+        bytes: ByteArray,
+        contentEncoding: String?
+    ): Any? {
+        return try {
+            val responseBodyClass = classLoader.loadClass("okhttp3.ResponseBody")
+            val newBody = createResponseBody(responseBodyClass, contentType, bytes)
+            if (newBody == null) {
+                Logger.e("Failed to recreate ResponseBody after consuming stream")
+                return null
+            }
+            val newBuilder = XposedHelpers.callMethod(response, "newBuilder")
+            XposedHelpers.callMethod(newBuilder, "body", newBody)
+            XposedHelpers.callMethod(newBuilder, "removeHeader", "Content-Length")
+            if (!contentEncoding.isNullOrBlank()) {
+                XposedHelpers.callMethod(newBuilder, "header", "Content-Encoding", contentEncoding)
+            } else {
+                XposedHelpers.callMethod(newBuilder, "removeHeader", "Content-Encoding")
+            }
+            val built = XposedHelpers.callMethod(newBuilder, "build")
+            if (built != null) {
+                processedResponses[built] = true
+            }
+            built
+        } catch (e: Throwable) {
+            Logger.e("Failed to rebuild response after consuming body", e)
+            null
         }
     }
 
@@ -287,23 +384,50 @@ class NetworkTimelineHook : BaseHook() {
     }
 
     private fun createResponseBody(responseBodyClass: Class<*>, contentType: Any?, bytes: ByteArray): Any? {
-        return try {
-            val createMethod = responseBodyClass.methods.firstOrNull { method ->
-                method.name == "create" &&
-                        method.parameterTypes.size == 2 &&
-                        method.parameterTypes[1] == ByteArray::class.java
+        val create2 = responseBodyClass.methods.firstOrNull { method ->
+            method.name == "create" &&
+                method.parameterTypes.size == 2 &&
+                method.parameterTypes[1] == ByteArray::class.java
+        }
+        if (create2 != null) {
+            try {
+                return create2.invoke(null, contentType, bytes)
+            } catch (e: Throwable) {
+                Logger.d("ResponseBody.create(MediaType, byte[]) failed: ${e.message}")
             }
+        }
 
-            if (createMethod != null) {
-                createMethod.invoke(null, contentType, bytes)
-            } else {
-                XposedHelpers.callStaticMethod(
-                    responseBodyClass,
-                    "create",
-                    contentType,
-                    bytes
-                )
+        try {
+            val loader = responseBodyClass.classLoader ?: return null
+            val bufferClass = loader.loadClass("okio.Buffer")
+            val buffer = bufferClass.getDeclaredConstructor().newInstance()
+            val write = bufferClass.methods.firstOrNull { method ->
+                method.name == "write" &&
+                    method.parameterTypes.size == 1 &&
+                    method.parameterTypes[0] == ByteArray::class.java
+            } ?: return null
+            write.invoke(buffer, bytes)
+
+            val create3 = responseBodyClass.methods.firstOrNull { method ->
+                method.name == "create" &&
+                    method.parameterTypes.size == 3 &&
+                    (method.parameterTypes[1] == Long::class.javaPrimitiveType ||
+                        method.parameterTypes[1] == java.lang.Long::class.java) &&
+                    method.parameterTypes[2].isInstance(buffer)
+            } ?: responseBodyClass.methods.firstOrNull { method ->
+                method.name == "create" &&
+                    method.parameterTypes.size == 3 &&
+                    method.parameterTypes[2].name == "okio.BufferedSource"
             }
+            if (create3 != null) {
+                return create3.invoke(null, contentType, bytes.size.toLong(), buffer)
+            }
+        } catch (e: Throwable) {
+            Logger.d("ResponseBody.create(MediaType, long, BufferedSource) failed: ${e.message}")
+        }
+
+        return try {
+            XposedHelpers.callStaticMethod(responseBodyClass, "create", contentType, bytes)
         } catch (e: Throwable) {
             Logger.e("Failed to create ResponseBody via reflection", e)
             null

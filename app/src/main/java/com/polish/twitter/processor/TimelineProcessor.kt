@@ -2,6 +2,7 @@ package com.polish.twitter.processor
 
 import com.polish.twitter.core.Constants
 import com.polish.twitter.core.Logger
+import com.polish.twitter.utils.SnowflakeUtils
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -11,8 +12,22 @@ import java.util.TimeZone
 object TimelineProcessor {
 
     private val SNOWFLAKE_REGEX = Regex("(\\d{16,20})")
-    private val TWITTER_DATE_FORMAT = SimpleDateFormat("EEE MMM dd HH:mm:ss Z yyyy", Locale.ENGLISH).apply {
-        timeZone = TimeZone.getTimeZone("UTC")
+
+    // 单趟正则替代原先 14 次 contains 全量扫描（每条 entry 只序列化+扫描一次）
+    private val AD_STRING_PATTERN = Regex(
+        "\"(promotedMetadata|promoted_metadata|advertiserResults|advertiser_name|advertiserName|" +
+            "disclosure_type|promotedPost|promotedContent|promotedTrend|promotedTweet)\"|" +
+            "\"(is_promoted|isPromoted|is_paid_promotion)\":true|" +
+            "\"source_type\":\"promoted\"",
+        RegexOption.IGNORE_CASE
+    )
+
+    // SimpleDateFormat 非线程安全：OkHttp 多线程并发解析时间线，
+    // 必须使用 ThreadLocal 隔离，避免共享 Calendar 状态导致的解析错乱/异常。
+    private val TWITTER_DATE_FORMAT = ThreadLocal.withInitial {
+        SimpleDateFormat("EEE MMM dd HH:mm:ss Z yyyy", Locale.ENGLISH).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }
     }
 
     /**
@@ -56,9 +71,10 @@ object TimelineProcessor {
         var modified = false
 
         // 1. 处理直接包含的 instructions
+        //    倒序遍历：删除元素后索引不回退，杜绝“跳过下一个元素”导致连续广告漏删
         val instructions = jsonObj.optJSONArray("instructions")
         if (instructions != null) {
-            for (i in 0 until instructions.length()) {
+            for (i in instructions.length() - 1 downTo 0) {
                 val instruction = instructions.optJSONObject(i) ?: continue
                 val type = instruction.optString("type", "")
 
@@ -66,8 +82,10 @@ object TimelineProcessor {
                     val entries = instruction.optJSONArray("entries")
                     if (entries != null && entries.length() > 0) {
                         val newEntries = processEntries(entries, enableAdBlock, enableChronoSort)
-                        instruction.put("entries", newEntries)
-                        modified = true
+                        if (newEntries !== entries) {
+                            instruction.put("entries", newEntries)
+                            modified = true
+                        }
                     }
                 } else if ((type == "TimelinePinEntry" || instruction.has("entry")) && enableAdBlock) {
                     val entry = instruction.optJSONObject("entry")
@@ -83,8 +101,10 @@ object TimelineProcessor {
         val directEntries = jsonObj.optJSONArray("entries")
         if (directEntries != null && !jsonObj.has("instructions")) {
             val newEntries = processEntries(directEntries, enableAdBlock, enableChronoSort)
-            jsonObj.put("entries", newEntries)
-            modified = true
+            if (newEntries !== directEntries) {
+                jsonObj.put("entries", newEntries)
+                modified = true
+            }
         }
 
         // 3. 递归遍历所有子对象和子数组
@@ -159,7 +179,6 @@ object TimelineProcessor {
 
             // 3. 提取推文 Snowflake ID
             val tweetId = extractTweetId(entry)
-            MediaCache.ingestObject(entry)
 
             if (tweetId > 0L) {
                 validTweetEntries.add(Pair(tweetId, entry))
@@ -170,6 +189,12 @@ object TimelineProcessor {
 
         if (adCount > 0) {
             Logger.d("Filtered $adCount ads/recommendations from timeline batch.")
+        }
+
+        // 无广告且不重排：交回原数组，避免 JSONObject.toString() 改 key 序。
+        // 网络层 bytes() 后若字符串“未变”仍必须重建 body；少一次无意义改写可少走改写失败路径。
+        if (adCount == 0 && !(enableChronoSort && validTweetEntries.size > 1)) {
+            return entries
         }
 
         // 4. 瀑布流按 Snowflake ID 降序（最新发布在最上方）
@@ -243,28 +268,9 @@ object TimelineProcessor {
             return true
         }
 
-        // 2. 深度 JSON 字符串特征匹配（无死角捕获任何嵌套深度的推广标识）
-        val entryStr = entry.toString()
-        if (entryStr.contains("\"promotedMetadata\"", ignoreCase = true) ||
-            entryStr.contains("\"promoted_metadata\"", ignoreCase = true) ||
-            entryStr.contains("\"advertiserResults\"", ignoreCase = true) ||
-            entryStr.contains("\"advertiser_name\"", ignoreCase = true) ||
-            entryStr.contains("\"advertiserName\"", ignoreCase = true) ||
-            entryStr.contains("\"disclosure_type\"", ignoreCase = true) ||
-            entryStr.contains("\"promotedPost\"", ignoreCase = true) ||
-            entryStr.contains("\"promotedContent\"", ignoreCase = true) ||
-            entryStr.contains("\"promotedTrend\"", ignoreCase = true) ||
-            entryStr.contains("\"promotedTweet\"", ignoreCase = true) ||
-            entryStr.contains("\"is_promoted\":true", ignoreCase = true) ||
-            entryStr.contains("\"isPromoted\":true", ignoreCase = true) ||
-            entryStr.contains("\"is_paid_promotion\":true", ignoreCase = true) ||
-            entryStr.contains("\"source_type\":\"promoted\"", ignoreCase = true)) {
-            return true
-        }
-
-        // 3. 结构化模块检查 (如推荐关注横栏、趋势轮播)
-        val content = entry.optJSONObject("content") ?: return false
-        val entryType = content.optString("entryType", "")
+        // 2. 结构化模块检查 (如推荐关注横栏、趋势轮播) —— 零序列化开销，优先执行
+        val content = entry.optJSONObject("content")
+        val entryType = content?.optString("entryType", "")
         if (entryType == "TimelineTimelineModule") {
             val clientEventInfo = content.optJSONObject("clientEventInfo")
             val component = clientEventInfo?.optString("component", "") ?: ""
@@ -275,6 +281,11 @@ object TimelineProcessor {
                 component.contains("topic", ignoreCase = true)) {
                 return true
             }
+        }
+
+        // 3. 深度 JSON 特征匹配（单趟正则兜底，无死角捕获任何嵌套深度的推广标识）
+        if (AD_STRING_PATTERN.containsMatchIn(entry.toString())) {
+            return true
         }
 
         return false
@@ -317,11 +328,11 @@ object TimelineProcessor {
                 ?: innerTweet?.optJSONObject("legacy")?.optString("created_at")
             if (!createdAt.isNullOrBlank()) {
                 try {
-                    val date = TWITTER_DATE_FORMAT.parse(createdAt)
+                    val date = TWITTER_DATE_FORMAT.get()?.parse(createdAt)
                     if (date != null) {
                         val epochMs = date.time
                         // 将 epochMs 反算为等价 Snowflake ID: (timestamp - TWITTER_EPOCH) << 22
-                        val pseudoSnowflake = (epochMs - 1288834974657L) shl 22
+                        val pseudoSnowflake = SnowflakeUtils.pseudoSnowflakeFromEpochMs(epochMs)
                         if (pseudoSnowflake > 0) return pseudoSnowflake
                     }
                 } catch (_: Throwable) {}

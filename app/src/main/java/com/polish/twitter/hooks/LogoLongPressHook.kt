@@ -10,6 +10,7 @@ import android.os.Vibrator
 import android.view.KeyEvent
 import android.view.MotionEvent
 import com.polish.twitter.core.Logger
+import com.polish.twitter.core.XHost
 import com.polish.twitter.ui.FloatingMenuManager
 import com.polish.twitter.ui.SettingsDialog
 import de.robv.android.xposed.XC_MethodHook
@@ -25,14 +26,14 @@ class LogoLongPressHook : BaseHook() {
 
     override fun init(classLoader: ClassLoader, context: Context) {
         try {
-            hookActivityLifecycle(classLoader)
+            hookActivityLifecycle()
             hookActivityTouchAndKey()
         } catch (e: Throwable) {
             Logger.e("Failed to initialize LogoLongPressHook", e)
         }
     }
 
-    private fun hookActivityLifecycle(classLoader: ClassLoader) {
+    private fun hookActivityLifecycle() {
         try {
             XposedHelpers.findAndHookMethod(
                 Activity::class.java,
@@ -92,7 +93,8 @@ class LogoLongPressHook : BaseHook() {
             XposedBridge.hookMethod(dispatchTouchMethod, object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val activity = param.thisObject as? Activity ?: return
-                    if (activity.javaClass.name != "com.x.android.main.MainActivity") return
+                    // 仅在主界面响应 Logo 双击/长按（类名清单集中维护于 XHost，升级只需改一处）
+                    if (!XHost.isMainActivity(activity.javaClass.name)) return
 
                     val event = param.args[0] as? MotionEvent ?: return
                     val density = activity.resources.displayMetrics.density
@@ -186,14 +188,10 @@ class LogoLongPressHook : BaseHook() {
 
     private fun triggerHaptic(context: Context) {
         try {
-            val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+            val vibrator = context.getSystemService(Vibrator::class.java)
             if (vibrator != null && vibrator.hasVibrator()) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    vibrator.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE))
-                } else {
-                    @Suppress("DEPRECATION")
-                    vibrator.vibrate(50)
-                }
+                // minSdk 26 >= O，始终可用 VibrationEffect
+                vibrator.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE))
             }
         } catch (_: Throwable) {
         }
