@@ -4,8 +4,6 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
-import android.graphics.Color
-import android.graphics.drawable.GradientDrawable
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -17,6 +15,7 @@ import com.polish.twitter.core.Constants
 import com.polish.twitter.core.Logger
 import com.polish.twitter.utils.DownloadResolver
 import com.polish.twitter.utils.Downloader
+import dev.polish.ui.PolishUi
 
 object FloatingMenuManager {
 
@@ -64,20 +63,15 @@ object FloatingMenuManager {
         (existing?.parent as? ViewGroup)?.removeView(existing)
 
         val dp = activity.resources.displayMetrics.density
-        val sizePx = (46 * dp).toInt()
+        val sizePx = (48 * dp).toInt()
 
         val floatingBtn = TextView(activity).apply {
-            text = "⚙️"
+            text = "P"
+            contentDescription = "TwitterPolish 快捷菜单"
             textSize = 20f
+            setTextColor(PolishUi.ACCENT)
             gravity = Gravity.CENTER
-
-            // 晶莹黑色圆底 + Twitter 蓝边框
-            val bg = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(Color.parseColor("#E615202B"))
-                setStroke((1.5f * dp).toInt(), Color.parseColor("#1D9BF0"))
-            }
-            background = bg
+            background = PolishUi.shape(activity, PolishUi.SURFACE, 18f, PolishUi.BORDER)
             elevation = 25 * dp
 
             var initialX = 0f
@@ -202,12 +196,13 @@ object FloatingMenuManager {
             Toast.makeText(activity, "悬浮球已隐藏，如需再次开启可长按顶部 X 进入设置", Toast.LENGTH_LONG).show()
         }
 
-        AlertDialog.Builder(activity)
-            .setTitle("✨ TwitterPolish 快捷菜单")
+        val dialog = AlertDialog.Builder(PolishUi.themed(activity))
+            .setTitle("TwitterPolish 快捷菜单")
             .setItems(options.toTypedArray()) { _, which ->
                 actions.getOrNull(which)?.invoke()
             }
             .setNegativeButton("取消", null)
             .show()
+        PolishUi.styleDialog(dialog)
     }
 }

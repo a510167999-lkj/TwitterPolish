@@ -38,24 +38,20 @@ class TimelineFilterHook : BaseHook() {
     }
 
     private fun hookModelPromotedCheck(classLoader: ClassLoader) {
-        val descriptor = DexKitManager.getMethodDescriptor(DexKitManager.KEY_TIMELINE_ITEM_IS_PROMOTED)
-        if (descriptor == null) {
+        val method = DexKitManager.getMethod(DexKitManager.KEY_TIMELINE_ITEM_IS_PROMOTED, classLoader)
+        if (method == null) {
             Logger.d("No cached isPromoted method descriptor found, skipping model hook.")
             return
         }
 
         try {
-            val (className, methodName) = descriptor
-            val targetClass = classLoader.loadClass(className)
-            XposedBridge.hookAllMethods(targetClass, methodName, object : XC_MethodHook() {
+            XposedBridge.hookMethod(method, object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     if (!adBlockEnabled) return
-                    // DexKit 只保证方法名；同名带参方法不能一律改返回值，否则时间线条目会整批消失。
-                    if (param.args.isNotEmpty()) return
                     param.result = false
                 }
             })
-            Logger.i("Hooked isPromoted method: $className#$methodName -> false")
+            Logger.i("Hooked validated isPromoted method: $method")
         } catch (e: Throwable) {
             Logger.w("Failed to hook isPromoted method", e)
         }

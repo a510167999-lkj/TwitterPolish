@@ -108,17 +108,21 @@ class NetworkTimelineHook : BaseHook() {
         }
     }
 
+    private var builderInstalled = false
+
+    fun installDiscovered(classLoader: ClassLoader) = hookOkHttp(classLoader)
+
+    @Synchronized
     private fun hookOkHttp(classLoader: ClassLoader) {
-        val okHttpBuilderClass = try {
-            classLoader.loadClass("okhttp3.OkHttpClient\$Builder")
-        } catch (e: ClassNotFoundException) {
-            val descriptor = DexKitManager.getMethodDescriptor(DexKitManager.KEY_OKHTTP_CLIENT_BUILD)
-            if (descriptor != null) {
-                classLoader.loadClass(descriptor.first)
-            } else {
-                null
+        if (builderInstalled) return
+        val buildMethod = runCatching {
+            classLoader.loadClass("okhttp3.OkHttpClient\$Builder").declaredMethods.singleOrNull {
+                it.name == "build" && it.parameterCount == 0 &&
+                    it.returnType.name == "okhttp3.OkHttpClient" &&
+                    !java.lang.reflect.Modifier.isStatic(it.modifiers) && !it.isBridge
             }
-        }
+        }.getOrNull() ?: DexKitManager.getMethod(DexKitManager.KEY_OKHTTP_CLIENT_BUILD, classLoader)
+        if (buildMethod == null) return
 
         val interceptorClass = try {
             classLoader.loadClass("okhttp3.Interceptor")
@@ -150,9 +154,9 @@ class NetworkTimelineHook : BaseHook() {
                 }
             )
 
-            if (okHttpBuilderClass != null) {
+            run {
                 @Suppress("UNCHECKED_CAST")
-                XposedBridge.hookAllMethods(okHttpBuilderClass, "build", object : XC_MethodHook() {
+                XposedBridge.hookMethod(buildMethod, object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         try {
                             val builder = param.thisObject
@@ -171,6 +175,7 @@ class NetworkTimelineHook : BaseHook() {
                         }
                     }
                 })
+                builderInstalled = true
             }
 
             try {

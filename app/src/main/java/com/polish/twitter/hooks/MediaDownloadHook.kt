@@ -24,6 +24,7 @@ import com.polish.twitter.utils.DownloadResolver
 import com.polish.twitter.utils.Downloader
 import com.polish.twitter.utils.HostOkHttp
 import com.polish.twitter.utils.PlayerPlaybackTracker
+import dev.polish.ui.PolishUi
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
@@ -372,11 +373,11 @@ class MediaDownloadHook : BaseHook() {
         if (activity.isFinishing) return
         val items = DownloadResolver.resolve(activity, tweetId, videoView)
         if (items.isEmpty()) {
-            AlertDialog.Builder(activity)
+            AlertDialog.Builder(PolishUi.themed(activity))
                 .setTitle("📥 下载推文媒体")
                 .setMessage("还没拿到这条视频的播放列表。\n请先让视频播放几秒再长按，模块会从 HLS 流合成完整 MP4。")
                 .setPositiveButton("知道了", null)
-                .show()
+                .show().also { PolishUi.styleDialog(it) }
             return
         }
         if (items.size == 1) {
@@ -399,7 +400,7 @@ class MediaDownloadHook : BaseHook() {
             }
         }
 
-        AlertDialog.Builder(activity)
+        AlertDialog.Builder(PolishUi.themed(activity))
             .setTitle("📥 下载媒体")
             .setItems(labels.toTypedArray()) { _, which ->
                 if (which == 0) {
@@ -410,7 +411,7 @@ class MediaDownloadHook : BaseHook() {
                 }
             }
             .setNegativeButton("取消", null)
-            .show()
+            .show().also { PolishUi.styleDialog(it) }
     }
 
     private fun confirmDownload(activity: Activity, media: ExtractedMedia) {
@@ -418,13 +419,13 @@ class MediaDownloadHook : BaseHook() {
         val extra = if (media.isVideo && MediaExtractor.isHlsPlaylistUrl(media.url)) {
             "\n将从播放列表选取最高分辨率并合成完整 MP4（含音轨）。"
         } else ""
-        AlertDialog.Builder(activity)
+        AlertDialog.Builder(PolishUi.themed(activity))
             .setTitle("📥 下载$kind")
             .setMessage("将保存到 ${if (media.isVideo) "Movies" else "Pictures"}/Twitter/\n${media.fileName}$extra")
             .setPositiveButton("立即下载") { _, _ ->
                 Downloader.download(activity, media)
             }
             .setNegativeButton("取消", null)
-            .show()
+            .show().also { PolishUi.styleDialog(it) }
     }
 }

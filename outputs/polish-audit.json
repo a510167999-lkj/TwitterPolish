@@ -1,0 +1,50 @@
+{
+  "project": "Twitterpolish",
+  "host_packages": [
+    "com.twitter.android"
+  ],
+  "modified_files": [
+    ".workbuddy/memory/2026-09-09.md",
+    ".workbuddy/memory/2026-09-10.md",
+    ".workbuddy/memory/MEMORY.md",
+    "app/src/main/java/com/polish/twitter/MainHook.kt",
+    "app/src/main/java/com/polish/twitter/core/DexKitManager.kt",
+    "app/src/main/java/com/polish/twitter/core/MethodTarget.kt",
+    "app/src/main/java/com/polish/twitter/hooks/MediaDownloadHook.kt",
+    "app/src/main/java/com/polish/twitter/hooks/NetworkTimelineHook.kt",
+    "app/src/main/java/com/polish/twitter/hooks/SettingsHook.kt",
+    "app/src/main/java/com/polish/twitter/hooks/TimelineFilterHook.kt",
+    "app/src/main/java/com/polish/twitter/ui/FloatingMenuManager.kt",
+    "app/src/main/java/com/polish/twitter/ui/SettingsDialog.kt",
+    "app/src/main/java/com/polish/twitter/utils/PlayerPlaybackTracker.kt",
+    "app/src/main/java/dev/polish/ui/PolishUi.java"
+  ],
+  "note": "",
+  "fixes": [
+    "DexKitManager：扫描移后台执行，基础挂点先安装，扫描完成后再安装依赖功能，不再阻塞启动",
+    "DexKitManager：缓存身份加入宿主版本/更新时间/base 与 split 路径及文件属性/规则 schema，坏缓存或解析异常一律作废重扫",
+    "新增 MethodTarget：完整 JVM 描述符与反射唯一性校验，不再用 class#method 这种丢失重载信息的格式",
+    "MainHook：拆分为基础阶段与扫描后阶段，逐功能幂等安装",
+    "TimelineFilterHook / SettingsHook / PlayerPlaybackTracker / NetworkTimelineHook：改为 getMethod 精确目标后 hookMethod，删除硬编码类名兜底与任意接口替换",
+    "SettingsDialog：改为统一 PolishUi 白卡 + Switch，保留全部 5 个开关、即时/保存语义、下载入口与原 prefs 键",
+    "FloatingMenu 与下载弹窗：白底蓝主色、48dp 触控，与统一规范一致"
+  ],
+  "tests": [
+    {
+      "command": "./gradlew --offline :app:testDebugUnitTest :app:assembleDebug (JDK17)",
+      "status": "pass",
+      "summary": "32 个单测全部通过，debug 包构建成功"
+    }
+  ],
+  "remaining": [
+    "X 的混淆类名与渲染入口结构变化后仍需 DexKit 重新发现，无法保证未来版本自动可用",
+    "未经真机验证：未安装模块、未重启 X"
+  ],
+  "runtime_verified": false,
+  "build_status": "pass",
+  "artifacts": [
+    "outputs/audit-build.log",
+    "app/build/outputs/apk/debug/app-debug.apk"
+  ],
+  "generated_at": "2026-09-14T08:40:02+08:00"
+}

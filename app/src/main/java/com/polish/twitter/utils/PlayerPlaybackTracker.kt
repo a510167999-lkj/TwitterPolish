@@ -168,13 +168,20 @@ object PlayerPlaybackTracker {
         }
     }
 
+    private val discoveredClasses = mutableSetOf<Class<*>>()
+
+    fun installDiscovered(classLoader: ClassLoader) = hookDexKitImpl(classLoader)
+
+    @Synchronized
     private fun hookDexKitImpl(classLoader: ClassLoader) {
-        val desc = DexKitManager.getMethodDescriptor(DexKitManager.KEY_EXOPLAYER_IMPL) ?: return
+        val target = DexKitManager.getTarget(DexKitManager.KEY_EXOPLAYER_IMPL, classLoader) ?: return
+        val clazz = target.declaringClass
+        if (clazz in discoveredClasses) return
         try {
-            val clazz = classLoader.loadClass(desc.first)
             XposedBridge.hookAllConstructors(clazz, attachCtor)
+            discoveredClasses.add(clazz)
             hookConcrete(clazz)
-            Logger.i("PlayerTracker hooked DexKit impl ${desc.first}")
+            Logger.i("PlayerTracker hooked validated DexKit class ${clazz.name}")
         } catch (t: Throwable) {
             Logger.w("PlayerTracker DexKit impl hook failed: ${t.message}")
         }

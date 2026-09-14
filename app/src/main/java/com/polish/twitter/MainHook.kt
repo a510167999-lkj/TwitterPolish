@@ -63,19 +63,11 @@ class MainHook : IXposedHookLoadPackage {
         try {
             Logger.i("Application context initialized. Starting DexKit and Hook subsystems...")
 
-            // 1. 动态初始化 DexKit 并加载/更新符号缓存
-            DexKitManager.init(context)
-
-            // 2. 延迟在上下文就绪后初始化各个 Hook，杜绝类加载时 Handler 崩溃
-            //    （Hook 实例被 XposedBridge 的回调强引用持有，无需额外字段防 GC）
-            val activeHooks = listOf(
-                NetworkTimelineHook(),
-                TimelineFilterHook(),
-                MediaDownloadHook(),
-                TabSwitcherHook(),
-                LogoLongPressHook(),
-                SettingsHook()
-            )
+            val network = NetworkTimelineHook()
+            val media = MediaDownloadHook()
+            val settings = SettingsHook()
+            // 不依赖扫描的网络、播放、快捷入口立即安装，避免错过宿主首个页面。
+            val activeHooks = listOf(network, media, TabSwitcherHook(), LogoLongPressHook(), settings)
 
             // 3. 依次初始化并注册各业务 Hook（单个失败不阻塞其余）
             for (hook in activeHooks) {
@@ -88,7 +80,18 @@ class MainHook : IXposedHookLoadPackage {
                 }
             }
 
-            Logger.i("🎉 All TwitterPolish hooks registered.")
+            DexKitManager.init(context, classLoader) {
+                val deferred = listOf<Pair<String, () -> Unit>>(
+                    "network" to { network.installDiscovered(classLoader) },
+                    "timeline model" to { TimelineFilterHook().init(classLoader, context) },
+                    "player" to { com.polish.twitter.utils.PlayerPlaybackTracker.installDiscovered(classLoader) },
+                    "settings" to { settings.installDiscovered(classLoader) }
+                )
+                deferred.forEach { (name, install) ->
+                    try { install() } catch (error: Throwable) { Logger.e("Deferred $name hook failed", error) }
+                }
+                Logger.i("DexKit installation pass completed; runtime behavior remains unverified.")
+            }
         } catch (e: Throwable) {
             contextReady.set(false)
             Logger.e("Error during TwitterPolish context initialization", e)

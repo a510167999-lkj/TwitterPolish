@@ -12,3 +12,8 @@
 *.apks
 *.aab
 /references/
+
+# 本地审计与构建产物（审计报告除外）
+outputs/*
+!outputs/polish-audit.json
+.workbuddy/
