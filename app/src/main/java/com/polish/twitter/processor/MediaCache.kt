@@ -129,12 +129,6 @@ object MediaCache {
         playerLockedAtNs = System.nanoTime() - PLAYER_LOCK_TTL_NS - 1_000_000L
     }
 
-    @Synchronized
-    fun noteTweetId(tweetId: String?) {
-        if (tweetId.isNullOrBlank()) return
-        currentTweetId = tweetId
-    }
-
     /**
      * 解析应下载的媒体。
      * [mediaId] 来自手指下的播放器时，只返回那一条视频（外加同推文原图），找不到就空列表，绝不改下别的片。
@@ -176,6 +170,13 @@ object MediaCache {
 
         return emptyList()
     }
+
+    /**
+     * 只返回这条推文自己的媒体。与 [resolve] 不同，查不到时不回落到“当前在播”，
+     * 否则复制一条纯文字推文的链接会弹出别的视频的下载。
+     */
+    @Synchronized
+    fun forTweet(tweetId: String): List<ExtractedMedia> = byTweetId[tweetId]?.let { sorted(it) }.orEmpty()
 
     fun bestVideo(): ExtractedMedia? = resolve().firstOrNull { it.isVideo }
 

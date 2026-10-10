@@ -6,9 +6,7 @@ import android.app.PendingIntent
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
-import android.media.MediaScannerConnection
 import android.net.Uri
-import android.os.Build
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
@@ -19,10 +17,7 @@ import com.polish.twitter.core.Logger
 import com.polish.twitter.processor.ExtractedMedia
 import com.polish.twitter.processor.MediaExtractor
 import java.io.File
-import java.io.FileOutputStream
 import java.io.InputStream
-import java.net.HttpURLConnection
-import java.net.URL
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -48,34 +43,31 @@ object Downloader {
         hlsAudioUrl: String = ""
     ) {
         val cleanUrl = downloadUrl.trim()
-        if (cleanUrl.isBlank()) {
-            showToast(context, "❌ 下载链接无效")
-            return
-        }
-        if (DownloadSecurity.isBlockedHost(cleanUrl)) {
-            Logger.w("Refusing download to blocked host: $cleanUrl")
+        val safeName = DownloadSecurity.safeDownloadFileName(fileName)
+        if (!DownloadSecurity.isHttps(cleanUrl) || DownloadSecurity.isBlockedHost(cleanUrl)) {
+            Logger.d("Refusing unsafe download")
             showToast(context, "❌ 下载链接不安全，已拦截")
             return
         }
         if (MediaExtractor.isHlsPlaylistUrl(cleanUrl)) {
             showToast(context, "📥 正在从播放流合成完整视频…")
-            Logger.i("HLS download requested: $cleanUrl audio=$hlsAudioUrl")
+            Logger.d("HLS download requested")
             executor.execute {
-                performHlsDownload(context.applicationContext, cleanUrl, hlsAudioUrl, fileName)
+                performHlsDownload(context.applicationContext, cleanUrl, hlsAudioUrl, safeName)
             }
             return
         }
         if (isVideo && MediaExtractor.isDashSegmentUrl(cleanUrl)) {
-            Logger.w("Refusing DASH segment URL: $cleanUrl")
+            Logger.d("Refusing DASH segment URL")
             showToast(context, "❌ 这是播放器分片。请等视频开播后再长按，将改为合成完整视频")
             return
         }
 
         showToast(context, "📥 开始下载${if (isVideo) "视频" else "图片"}…")
-        Logger.i("Download requested: $cleanUrl -> $fileName")
+        Logger.d("Download requested: $safeName")
 
         executor.execute {
-            performDownload(context.applicationContext, cleanUrl, fileName, isVideo)
+            performDownload(context.applicationContext, cleanUrl, safeName, isVideo)
         }
     }
 
@@ -96,14 +88,12 @@ object Downloader {
 
         var outputStream: java.io.OutputStream? = null
         var outputUri: Uri? = null
-        var opened: HostOkHttp.OpenedStream? = null
-        var connection: HttpURLConnection? = null
+        var sourceClose: (() -> Unit)? = null
 
         try {
-            Logger.i("Connecting to: $downloadUrl")
+            Logger.d("Connecting download")
             val source = openSource(downloadUrl)
-            opened = source.okHttp
-            connection = source.connection
+            sourceClose = source.close
             val inputStream = source.stream
             var totalBytes = source.contentLength
 
@@ -111,35 +101,23 @@ object Downloader {
                 throw RuntimeException("CDN 返回的是 ${totalBytes}B 分片，不是完整视频")
             }
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val mimeType = if (isVideo) "video/mp4" else "image/jpeg"
-                val collection = if (isVideo)
-                    MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-                else
-                    MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-
-                val values = ContentValues().apply {
-                    put(if (isVideo) MediaStore.Video.Media.DISPLAY_NAME else MediaStore.Images.Media.DISPLAY_NAME, fileName)
-                    put(if (isVideo) MediaStore.Video.Media.MIME_TYPE else MediaStore.Images.Media.MIME_TYPE, mimeType)
-                    put(
-                        if (isVideo) MediaStore.Video.Media.RELATIVE_PATH else MediaStore.Images.Media.RELATIVE_PATH,
-                        if (isVideo) "${Environment.DIRECTORY_MOVIES}/Twitter" else "${Environment.DIRECTORY_PICTURES}/Twitter"
-                    )
-                    put(if (isVideo) MediaStore.Video.Media.IS_PENDING else MediaStore.Images.Media.IS_PENDING, 1)
-                }
-
-                outputUri = context.contentResolver.insert(collection, values)
-                    ?: throw RuntimeException("MediaStore 无法创建文件")
-                outputStream = context.contentResolver.openOutputStream(outputUri)
-                    ?: throw RuntimeException("无法打开 MediaStore 输出流")
-            } else {
-                val dirType = if (isVideo) Environment.DIRECTORY_MOVIES else Environment.DIRECTORY_PICTURES
-                val dir = File(Environment.getExternalStoragePublicDirectory(dirType), "Twitter")
-                dir.mkdirs()
-                val outFile = File(dir, fileName)
-                outputUri = Uri.fromFile(outFile)
-                outputStream = FileOutputStream(outFile)
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                put(MediaStore.MediaColumns.MIME_TYPE, mimeType(fileName, isVideo))
+                put(
+                    MediaStore.MediaColumns.RELATIVE_PATH,
+                    if (isVideo) "${Environment.DIRECTORY_MOVIES}/Twitter" else "${Environment.DIRECTORY_PICTURES}/Twitter"
+                )
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
             }
+            val collection = if (isVideo)
+                MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            else
+                MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            outputUri = context.contentResolver.insert(collection, values)
+                ?: throw RuntimeException("MediaStore 无法创建文件")
+            outputStream = context.contentResolver.openOutputStream(outputUri)
+                ?: throw RuntimeException("无法打开 MediaStore 输出流")
 
             val buffer = ByteArray(16 * 1024)
             // 打开输出流后立即转局部变量，全程使用局部引用（此处经流程分析已保证非空）
@@ -192,29 +170,20 @@ object Downloader {
             out.close()
             inputStream.close()
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && outputUri != null) {
-                val cv = ContentValues().apply {
-                    put(if (isVideo) MediaStore.Video.Media.IS_PENDING else MediaStore.Images.Media.IS_PENDING, 0)
-                }
-                context.contentResolver.update(outputUri, cv, null, null)
-            } else {
-                val filePath = outputUri?.path ?: return
-                MediaScannerConnection.scanFile(
-                    context,
-                    arrayOf(filePath),
-                    arrayOf(if (isVideo) "video/mp4" else "image/jpeg"),
-                    null
-                )
-            }
+            context.contentResolver.update(
+                outputUri,
+                ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) },
+                null,
+                null
+            )
 
             Logger.i("Download complete: $fileName (${totalRead / 1024} KB)")
 
             val viewIntent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(outputUri, if (isVideo) "video/*" else "image/*")
+                setDataAndType(outputUri, mimeType(fileName, isVideo))
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-            val pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT or
-                    (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0)
+            val pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             val pi = PendingIntent.getActivity(context, notificationId, viewIntent, pendingFlags)
 
             val doneNotif = NotificationCompat.Builder(context, CHANNEL_ID)
@@ -233,7 +202,7 @@ object Downloader {
             Logger.e("Download failed: ${e.message}", e)
             outputStream?.runCatching { close() }
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && outputUri != null) {
+            if (outputUri != null) {
                 try { context.contentResolver.delete(outputUri, null, null) } catch (_: Throwable) {}
             }
 
@@ -248,8 +217,7 @@ object Downloader {
             tryNotify(notificationManager, notificationId, errNotif)
             showToast(context, "❌ 下载失败: ${e.localizedMessage}")
         } finally {
-            opened?.close?.invoke()
-            connection?.disconnect()
+            sourceClose?.invoke()
         }
     }
 
@@ -307,8 +275,7 @@ object Downloader {
                 setDataAndType(outputUri, "video/*")
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-            val pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT or
-                    (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0)
+            val pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             val pi = PendingIntent.getActivity(context, notificationId, viewIntent, pendingFlags)
             tryNotify(
                 notificationManager,
@@ -347,49 +314,22 @@ object Downloader {
     private data class Source(
         val stream: InputStream,
         val contentLength: Long,
-        val okHttp: HostOkHttp.OpenedStream?,
-        val connection: HttpURLConnection?
+        val close: () -> Unit
     )
 
     private fun openSource(downloadUrl: String): Source {
-        // 仅白名单域名允许携带宿主凭证（Cookie/Authorization）走宿主 OkHttp；
-        // 其余域名一律匿名连接，防止用户 Twitter 凭证外泄到第三方域。
         val trusted = DownloadSecurity.mayAttachCredentials(downloadUrl)
-        if (trusted) {
-            val viaOkHttp = HostOkHttp.open(downloadUrl)
-            if (viaOkHttp != null) {
-                Logger.i("Downloading via host OkHttp, length=${viaOkHttp.contentLength}")
-                return Source(viaOkHttp.stream, viaOkHttp.contentLength, viaOkHttp, null)
-            }
-        }
+        val opened = DownloadClient.open(downloadUrl, trusted)
+        Logger.d("Download opened, credentials=$trusted length=${opened.contentLength}")
+        return Source(opened.stream, opened.contentLength, opened.close)
+    }
 
-        Logger.i("Host OkHttp unavailable or untrusted host, falling back to anonymous HttpURLConnection")
-        val url = URL(downloadUrl)
-        val connection = url.openConnection() as HttpURLConnection
-        connection.instanceFollowRedirects = true
-        connection.connectTimeout = 20000
-        connection.readTimeout = 90000
-        connection.setRequestProperty(
-            "User-Agent",
-            "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-        )
-        connection.setRequestProperty("Accept", "video/mp4,image/jpeg,image/*,*/*;q=0.8")
-        connection.setRequestProperty("Accept-Encoding", "identity")
-        // 匿名路径不带 Cookie；仅对可信媒体域名附加站内 Referer/Origin
-        if (trusted) {
-            connection.setRequestProperty("Referer", "https://x.com/")
-            connection.setRequestProperty("Origin", "https://x.com")
-            HostOkHttp.cookie?.let { connection.setRequestProperty("Cookie", it) }
-        }
-        connection.connect()
-
-        val responseCode = connection.responseCode
-        Logger.i("HTTP $responseCode for $downloadUrl")
-        if (responseCode !in 200..299) {
-            connection.disconnect()
-            throw RuntimeException("HTTP 错误 $responseCode")
-        }
-        return Source(connection.inputStream, connection.contentLengthLong, null, connection)
+    /** 原图可能是 PNG；一律写 image/jpeg 会让相册按错误格式解析。 */
+    internal fun mimeType(fileName: String, isVideo: Boolean): String = when {
+        isVideo -> "video/mp4"
+        fileName.endsWith(".png", ignoreCase = true) -> "image/png"
+        fileName.endsWith(".webp", ignoreCase = true) -> "image/webp"
+        else -> "image/jpeg"
     }
 
     private fun tryNotify(nm: NotificationManager?, id: Int, notification: android.app.Notification) {
@@ -401,7 +341,7 @@ object Downloader {
     }
 
     private fun ensureNotificationChannel(nm: NotificationManager?) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && nm != null) {
+        if (nm != null) {
             val ch = NotificationChannel(CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_LOW).apply {
                 description = "TwitterPolish 视频与图片下载进度"
                 enableVibration(false)

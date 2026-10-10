@@ -214,14 +214,19 @@ object MediaExtractor {
             }
         }
 
+        // 12.33：media_entities[].media_results.result = ApiMedia{media_id, media_info{__typename ApiVideo|ApiGif|ApiImage}}
+        val ownMediaId = obj.optString("id_str").ifBlank { obj.optString("media_id") }
         val videoInfo = obj.optJSONObject("video_info")
             ?: obj.optJSONObject("videoInfo")
             ?: obj.optJSONObject("media_info")
             ?: obj.optJSONObject("mediaInfo")
-        if (videoInfo != null) {
+        if (videoInfo != null && videoInfo.optString("__typename") == "ApiImage") {
+            val raw = videoInfo.optString("original_img_url")
+            if (raw.contains("pbs.twimg.com")) out.add(photo(raw, tweetId, ownMediaId))
+        } else if (videoInfo != null) {
             val picked = pickBestDownloadVariant(videoInfo)
             picked?.let {
-                val mediaId = obj.optString("id_str").ifBlank {
+                val mediaId = ownMediaId.ifBlank {
                     extractMediaId(it.url) ?: tweetId
                 }
                 val baseId = tweetId.ifBlank { mediaId }
@@ -236,19 +241,7 @@ object MediaExtractor {
         } else if (obj.optString("type") == "photo") {
             val raw = obj.optString("media_url_https").ifBlank { obj.optString("media_url") }
             if (raw.isNotBlank() && raw.contains("pbs.twimg.com")) {
-                val orig = toOriginalImageUrl(raw)
-                val mediaId = obj.optString("id_str").ifBlank { tweetId }
-                val baseId = tweetId.ifBlank { mediaId.ifBlank { "img" } }
-                val ext = if (raw.contains(".png")) "png" else "jpg"
-                out.add(
-                    ExtractedMedia(
-                        url = orig,
-                        isVideo = false,
-                        fileName = "twitter_${baseId}_photo.$ext",
-                        tweetId = tweetId,
-                        mediaId = mediaId
-                    )
-                )
+                out.add(photo(raw, tweetId, ownMediaId))
             }
         }
 
@@ -265,6 +258,19 @@ object MediaExtractor {
                 }
             }
         }
+    }
+
+    private fun photo(raw: String, tweetId: String, ownMediaId: String): ExtractedMedia {
+        val mediaId = ownMediaId.ifBlank { tweetId }
+        val baseId = tweetId.ifBlank { mediaId.ifBlank { "img" } }
+        val ext = if (raw.contains(".png")) "png" else "jpg"
+        return ExtractedMedia(
+            url = toOriginalImageUrl(raw),
+            isVideo = false,
+            fileName = "twitter_${baseId}_photo.$ext",
+            tweetId = tweetId,
+            mediaId = mediaId
+        )
     }
 
     private fun isTweetLikeNode(obj: JSONObject): Boolean {
@@ -317,7 +323,7 @@ object MediaExtractor {
             val contentType = variant.optString("content_type").ifBlank {
                 variant.optString("contentType")
             }
-            val bitrate = variant.optLong("bitrate", 0L)
+            val bitrate = variant.optLong("bitrate", variant.optLong("bit_rate", 0L))
             val videoUrl = variant.optString("url")
             if (contentType.contains("mp4") && isProgressiveMp4Url(videoUrl)) {
                 if (bitrate > maxBitrate || bestUrl == null) {

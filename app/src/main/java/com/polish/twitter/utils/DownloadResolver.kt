@@ -1,5 +1,6 @@
 package com.polish.twitter.utils
 
+import android.app.Activity
 import android.content.Context
 import android.view.View
 import com.polish.twitter.processor.ExtractedMedia
@@ -10,11 +11,11 @@ import com.polish.twitter.processor.MediaExtractor
  * 长按 / 悬浮球 / 设置共用的保存解析。
  *
  * 关键语义（真机回归教训）：
- * - 长按（有 videoView）：必须只认手指下那块画面。view→player 解析失败时
- *   **绝不回落**全局播放器选择——selectPlayer 会抓到预取的下一条/上一条，
- *   导致“长按 A 保存 B”，这是相册出现重复错误视频的直接原因。
- * - 悬浮球 / 设置按钮（无 videoView）：没有手指信息，允许全局播放器选择。
- * - 播放器锁只在新鲜窗口内可信（MediaCache.freshPlayerLockMediaId）。
+ * - 长按（有 videoView）：必须只认手指下那块画面。认不出就返回空列表让用户重试，
+ *   **绝不回落**全局播放器、播放器锁或「Exo 缓存里最近一条」——那些都可能是预取的上一条/下一条，
+ *   甚至是早已删除的视频（真机：不同视频都解析成同一个已 404 的 mediaId）。
+ * - 悬浮球 / 设置按钮（无 videoView）：没有手指信息，允许按可见、在播、面积最大选播放器。
+ * - Exo 缓存只按已确定的 mediaId 查，不再猜。
  */
 object DownloadResolver {
 
@@ -23,24 +24,22 @@ object DownloadResolver {
         tweetId: String? = null,
         videoView: View? = null
     ): List<ExtractedMedia> {
-        val fromView = videoView?.let { PlayerPlaybackTracker.syncViewIntoCache(it) }
-        // 长按路径（videoView != null）绝不回落全局播放器选择；
-        // 悬浮球 / 设置路径（videoView == null）没有手指信息，才允许全局选择。
-        val playingId = fromView
-            ?: if (videoView == null) PlayerPlaybackTracker.syncPlayingIntoCache() else null
-
-        // 新鲜锁：真实渲染/在播事件 10 秒内写入的 mediaId，可信；过期锁不采信
-        val freshLock = MediaCache.freshPlayerLockMediaId()
-        val effectiveMediaId = playingId ?: freshLock
-
-        val items = MediaCache.resolve(tweetId, effectiveMediaId)
-        val probeId = effectiveMediaId ?: MediaCache.currentMediaId
-        val hls = try {
-            ExoCacheProbe.findCurrentHls(context, probeId)
-        } catch (_: Throwable) {
-            null
+        val playingId = if (videoView != null) {
+            PlayerPlaybackTracker.syncViewIntoCache(videoView) ?: return emptyList()
+        } else {
+            PlayerPlaybackTracker.syncPlayingIntoCache(context as? Activity)
+                ?: MediaCache.freshPlayerLockMediaId()
         }
-        return merge(items, hls, playingId ?: probeId)
+
+        val items = MediaCache.resolve(tweetId, playingId)
+        val hls = playingId?.let {
+            try {
+                ExoCacheProbe.findCurrentHls(context, it)
+            } catch (_: Throwable) {
+                null
+            }
+        }
+        return merge(items, hls, playingId)
     }
 
     internal fun merge(
@@ -54,7 +53,7 @@ object DownloadResolver {
         }
         if (hls == null) return result
 
-        val idx = result.indexOfFirst { it.isVideo && sameVideo(it, hls, playingId) }
+        val idx = result.indexOfFirst { it.isVideo && sameVideo(it, hls) }
         if (idx >= 0) {
             val existing = result[idx]
             if (MediaExtractor.downloadQuality(hls) > MediaExtractor.downloadQuality(existing)) {
@@ -84,14 +83,9 @@ object DownloadResolver {
         return result
     }
 
-    private fun sameVideo(item: ExtractedMedia, hls: ExtractedMedia, playingId: String?): Boolean {
-        if (item.mediaId.isNotBlank() && hls.mediaId.isNotBlank()) {
-            return item.mediaId == hls.mediaId
-        }
-        if (playingId != null && item.mediaId.isNotBlank()) {
-            return item.mediaId == playingId
-        }
-        return true
+    private fun sameVideo(item: ExtractedMedia, hls: ExtractedMedia): Boolean {
+        if (item.mediaId.isBlank() || hls.mediaId.isBlank()) return false
+        return item.mediaId == hls.mediaId
     }
 
     private fun prioritize(items: List<ExtractedMedia>, playingId: String): List<ExtractedMedia> {

@@ -60,4 +60,17 @@ class TimelineApiUrlTest {
             Constants.isTimelineApiUrl("https://x.com/i/api/graphql/hash/Bookmarks")
         )
     }
+
+    @Test
+    fun x1233OperationNamesAreRecognized() {
+        // WHY: 12.33 用自家 Apollo 操作名。名单只有 Web 旧名时，关注流、详情页、书签、搜索的响应
+        // 全部不经处理——这是 1.0.7 在 12.33 上去广告失效的另一个原因。
+        for (op in listOf("HomeTimelineLatest", "ConversationTimeline", "BookmarksTimelineQuery", "SearchTimelineQuery")) {
+            assertTrue(op, Constants.isTimelineApiUrl("https://api.x.com/graphql/abc/$op?variables=%7B%7D"))
+        }
+        assertFalse(
+            "推荐关注页本身不能过滤，否则页面被清空",
+            Constants.isTimelineApiUrl("https://api.x.com/graphql/abc/ConnectTabTimelineQuery")
+        )
+    }
 }

@@ -20,7 +20,7 @@ object HlsDownloader {
         onProgress: (String) -> Unit = {}
     ) {
         workDir.mkdirs()
-        val masterText = readUtf8(playlistUrl)
+        val masterText = readUtf8(playlistUrl, playlistUrl)
         val videoPlaylist: String
         var audioPlaylist = audioPlaylistUrl?.takeIf { it.isNotBlank() }
 
@@ -30,22 +30,22 @@ object HlsDownloader {
             videoPlaylist = best.videoUrl
             audioPlaylist = best.audioUrl ?: audioPlaylist
             onProgress("最高清 ${best.width}x${best.height}")
-            Logger.i("HLS master picked ${best.width}x${best.height} bw=${best.bandwidth} audio=${best.audioUrl}")
+            Logger.d("HLS master picked ${best.width}x${best.height} bw=${best.bandwidth}")
         } else {
             videoPlaylist = playlistUrl
-            Logger.i("HLS media playlist (no master): $playlistUrl")
+            Logger.d("HLS media playlist (no master)")
         }
 
         onProgress("拉取视频分片…")
         val videoPart = File(workDir, "video.mp4")
-        concatPlaylist(videoPlaylist, videoPart)
+        concatPlaylist(videoPlaylist, videoPart, playlistUrl)
 
         var audioPart: File? = null
         if (!audioPlaylist.isNullOrBlank()) {
             onProgress("拉取音轨…")
             val aud = File(workDir, "audio.mp4")
             try {
-                concatPlaylist(audioPlaylist, aud)
+                concatPlaylist(audioPlaylist, aud, playlistUrl)
                 audioPart = aud
             } catch (t: Throwable) {
                 Logger.w("Audio track download failed, continuing video-only: ${t.message}")
@@ -70,16 +70,16 @@ object HlsDownloader {
         Logger.i("HLS mux complete: ${output.length()} bytes")
     }
 
-    private fun concatPlaylist(playlistUrl: String, dest: File) {
-        val text = readUtf8(playlistUrl)
+    private fun concatPlaylist(playlistUrl: String, dest: File, anchor: String) {
+        val text = readUtf8(playlistUrl, anchor)
         val media = HlsPlaylistParser.parseMedia(text, playlistUrl)
         if (media.mapUrl == null && media.segments.isEmpty()) {
             throw RuntimeException("空的 HLS 播放列表")
         }
         FileOutputStream(dest).use { out ->
-            media.mapUrl?.let { copyUrl(it, out) }
+            media.mapUrl?.let { copyUrl(it, out, anchor) }
             for (seg in media.segments) {
-                copyUrl(seg, out)
+                copyUrl(seg, out, anchor)
             }
         }
     }
@@ -201,16 +201,16 @@ object HlsDownloader {
         }
     }
 
-    private fun readUtf8(url: String): String {
-        val src = open(url)
+    private fun readUtf8(url: String, anchor: String): String {
+        val src = open(url, anchor)
         return src.stream.bufferedReader(Charsets.UTF_8).use { it.readText() }.also {
             src.close()
             if (!it.contains("#EXTM3U")) throw RuntimeException("不是 HLS 播放列表")
         }
     }
 
-    private fun copyUrl(url: String, out: FileOutputStream) {
-        val src = open(url)
+    private fun copyUrl(url: String, out: FileOutputStream, anchor: String) {
+        val src = open(url, anchor)
         try {
             src.stream.copyTo(out)
         } finally {
@@ -220,29 +220,11 @@ object HlsDownloader {
 
     private data class Opened(val stream: java.io.InputStream, val close: () -> Unit)
 
-    private fun open(url: String): Opened {
-        if (DownloadSecurity.isBlockedHost(url)) {
-            throw RuntimeException("Blocked host in HLS: $url")
-        }
-        val via = HostOkHttp.open(url)
-        if (via != null) return Opened(via.stream, via.close)
-        val trusted = DownloadSecurity.mayAttachCredentials(url)
-        val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
-        conn.instanceFollowRedirects = true
-        conn.connectTimeout = 20000
-        conn.readTimeout = 60000
-        conn.setRequestProperty("User-Agent", "Mozilla/5.0")
-        // 匿名路径：仅可信媒体域名附带站内 Referer/Origin
-        if (trusted) {
-            conn.setRequestProperty("Referer", "https://x.com/")
-            conn.setRequestProperty("Origin", "https://x.com")
-        }
-        conn.connect()
-        if (conn.responseCode !in 200..299) {
-            conn.disconnect()
-            throw RuntimeException("HTTP ${conn.responseCode} $url")
-        }
-        return Opened(conn.inputStream) { conn.disconnect() }
+    private fun open(url: String, anchor: String): Opened {
+        val pin = DownloadSecurity.hostOf(anchor) ?: throw RuntimeException("无效播放列表地址")
+        val credentials = DownloadSecurity.mayAttachCredentials(anchor)
+        val opened = DownloadClient.open(url, credentials, pin)
+        return Opened(opened.stream, opened.close)
     }
 
     fun copyFileTo(src: File, dest: java.io.OutputStream) {

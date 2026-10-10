@@ -6,7 +6,7 @@ import java.lang.reflect.Modifier
 
 /**
  * 复用 X 进程里的 OkHttpClient，下载走与播放相同的 TLS / Cookie。
- * 字段由 NetworkTimelineHook 在 RealCall 上捕获。
+ * 客户端与 Cookie 由 NetworkTimelineHook 在 RealCall 上捕获。
  */
 object HostOkHttp {
 
@@ -14,59 +14,68 @@ object HostOkHttp {
     var client: Any? = null
 
     @Volatile
+    private var capturedFromApi = false
+
+    @Volatile
     var cookie: String? = null
 
-    @Volatile
-    var authorization: String? = null
-
-    @Volatile
-    var csrfToken: String? = null
-
-    data class OpenedStream(
-        val stream: InputStream,
+    data class OneHop(
+        val code: Int,
+        val stream: InputStream?,
         val contentLength: Long,
+        val location: String?,
         val close: () -> Unit
     )
 
-    fun captureClient(realCallOrClient: Any) {
-        if (client != null) return
+    /**
+     * 只接受白名单主机上的客户端。CDN 客户端可以被后来的 API 客户端替换，
+     * 一旦拿到 API 客户端就不再换成别的。
+     */
+    @Synchronized
+    fun captureClient(realCallOrClient: Any, requestUrl: String?) {
+        if (requestUrl.isNullOrBlank() || !DownloadSecurity.isAllowedMediaUrl(requestUrl)) return
+        val fromApi = DownloadSecurity.isPreferredApiHost(requestUrl)
+        if (client != null && (capturedFromApi || !fromApi)) return
         try {
-            val cls = realCallOrClient.javaClass
-            if (cls.name == "okhttp3.OkHttpClient") {
-                client = realCallOrClient
-                return
-            }
-            val field = cls.declaredFields.firstOrNull {
-                it.name == "client" || it.type.name == "okhttp3.OkHttpClient"
-            }
-            if (field != null) {
-                field.isAccessible = true
-                client = field.get(realCallOrClient)
-            }
+            val extracted = extractClient(realCallOrClient) ?: return
+            client = extracted
+            capturedFromApi = fromApi
         } catch (t: Throwable) {
             Logger.d("HostOkHttp.captureClient: ${t.message}")
         }
     }
 
-    fun captureAuthFromRequest(request: Any) {
+    private fun extractClient(realCallOrClient: Any): Any? {
+        val cls = realCallOrClient.javaClass
+        if (cls.name == "okhttp3.OkHttpClient") return realCallOrClient
+        val field = cls.declaredFields.firstOrNull {
+            it.name == "client" || it.type.name == "okhttp3.OkHttpClient"
+        } ?: return null
+        field.isAccessible = true
+        return field.get(realCallOrClient)
+    }
+
+    /** 只留下载 CDN 需要的 Cookie；Authorization / csrf 用不到，不在进程里多留一份凭据。 */
+    fun captureCookieFromRequest(request: Any) {
         try {
             cookie = header(request, "Cookie") ?: cookie
-            authorization = header(request, "Authorization") ?: authorization
-            csrfToken = header(request, "x-csrf-token") ?: header(request, "X-Csrf-Token") ?: csrfToken
         } catch (_: Throwable) {
         }
     }
 
-    fun open(url: String): OpenedStream? {
-        // 安全边界：宿主 OkHttpClient 可能由认证拦截器自动附加 Authorization，
-        // 因此仅允许携带凭证访问白名单媒体域名，其余一律返回 null 走匿名回退。
+    /**
+     * 单跳请求。调用方负责跟随重定向。
+     * 关不掉宿主客户端的自动重定向时返回 null，让调用方改走 HttpURLConnection。
+     */
+    fun openHop(url: String): OneHop? {
         if (!DownloadSecurity.mayAttachCredentials(url)) {
-            Logger.d("HostOkHttp refused (untrusted host): $url")
+            Logger.d("HostOkHttp refused untrusted host")
             return null
         }
         val okClient = client ?: return null
+        val safeClient = withoutRedirects(okClient) ?: return null
         return try {
-            val loader = okClient.javaClass.classLoader ?: return null
+            val loader = safeClient.javaClass.classLoader ?: return null
             val builderClass = loader.loadClass("okhttp3.Request\$Builder")
             val builder = builderClass.getDeclaredConstructor().newInstance()
 
@@ -94,20 +103,29 @@ object HostOkHttp {
 
             val request = builderClass.getMethod("build").invoke(builder)
             val requestClass = loader.loadClass("okhttp3.Request")
-            val newCall = okClient.javaClass.methods.first {
+            val newCall = safeClient.javaClass.methods.first {
                 it.name == "newCall" && it.parameterTypes.size == 1 && it.parameterTypes[0] == requestClass
             }
-            val call = newCall.invoke(okClient, request)
-            val response = call.javaClass.getMethod("execute").invoke(call)
+            val call = newCall.invoke(safeClient, request)
+            val response = call.javaClass.getMethod("execute").invoke(call) ?: return null
             val code = (response.javaClass.methods.first { it.name == "code" && it.parameterTypes.isEmpty() }
                 .invoke(response) as Number).toInt()
-            if (code !in 200..299) {
-                Logger.w("HostOkHttp HTTP $code for $url")
+            if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
+                val location = header(response, "Location")
                 closeQuietly(response)
-                return null
+                return OneHop(code, null, -1L, location) {}
+            }
+            if (code !in 200..299) {
+                Logger.d("HostOkHttp HTTP $code")
+                closeQuietly(response)
+                return OneHop(code, null, -1L, null) {}
             }
             val body = response.javaClass.methods.first { it.name == "body" && it.parameterTypes.isEmpty() }
-                .invoke(response) ?: return null
+                .invoke(response)
+            if (body == null) {
+                closeQuietly(response)
+                return OneHop(code, null, -1L, null) {}
+            }
             val length = try {
                 (body.javaClass.methods.first { it.name == "contentLength" && it.parameterTypes.isEmpty() }
                     .invoke(body) as Number).toLong()
@@ -116,11 +134,33 @@ object HostOkHttp {
             }
             val stream = body.javaClass.methods.first { it.name == "byteStream" && it.parameterTypes.isEmpty() }
                 .invoke(body) as InputStream
-            OpenedStream(stream, length) {
+            OneHop(code, stream, length, null) {
                 closeQuietly(response)
             }
         } catch (t: Throwable) {
-            Logger.w("HostOkHttp.open failed: ${t.message}")
+            Logger.d("HostOkHttp.openHop failed: ${t.message}")
+            null
+        }
+    }
+
+    private fun withoutRedirects(okClient: Any): Any? {
+        return try {
+            val newBuilder = okClient.javaClass.methods.firstOrNull {
+                it.name == "newBuilder" && it.parameterTypes.isEmpty()
+            } ?: return null
+            val builder = newBuilder.invoke(okClient) ?: return null
+            for (name in listOf("followRedirects", "followSslRedirects")) {
+                val method = builder.javaClass.methods.firstOrNull {
+                    it.name == name && it.parameterTypes.size == 1 &&
+                        it.parameterTypes[0] == java.lang.Boolean.TYPE
+                } ?: return null
+                method.invoke(builder, false)
+            }
+            builder.javaClass.methods.firstOrNull {
+                it.name == "build" && it.parameterTypes.isEmpty()
+            }?.invoke(builder)
+        } catch (t: Throwable) {
+            Logger.d("HostOkHttp.withoutRedirects: ${t.message}")
             null
         }
     }

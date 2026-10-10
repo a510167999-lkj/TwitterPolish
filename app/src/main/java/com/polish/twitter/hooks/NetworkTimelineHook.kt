@@ -1,10 +1,10 @@
 package com.polish.twitter.hooks
 
 import android.content.Context
-import android.content.SharedPreferences
 import com.polish.twitter.core.Constants
 import com.polish.twitter.core.DexKitManager
 import com.polish.twitter.core.Logger
+import com.polish.twitter.core.Settings
 import com.polish.twitter.processor.MediaCache
 import com.polish.twitter.processor.TimelineProcessor
 import com.polish.twitter.utils.HostOkHttp
@@ -23,37 +23,18 @@ import java.util.WeakHashMap
 import java.util.zip.GZIPInputStream
 import java.util.zip.GZIPOutputStream
 
-class NetworkTimelineHook : BaseHook() {
+/**
+ * 网络层唯一入口：给所有 OkHttpClient 注入时间线拦截器，并在 RealCall 上统一观察请求。
+ * [onRequestUrl] 供媒体模块从播放请求里认出当前视频，避免它再单独挂一遍 RealCall。
+ */
+class NetworkTimelineHook(private val onRequestUrl: (String) -> Unit) : BaseHook() {
 
     override val name: String = "NetworkTimelineHook"
-
-    @Volatile
-    private var enableAdBlock = true
-
-    @Volatile
-    private var enableChronoSort = true
-
-    // SharedPreferences 对 listener 只持 WeakReference，必须自己留强引用。
-    private var prefsListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
 
     // 拦截器与 RealCall.afterHook 会看到同一条响应；重建后的实例记在这里，避免二次 bytes()。
     private val processedResponses = Collections.synchronizedMap(WeakHashMap<Any, Boolean>())
 
     override fun init(classLoader: ClassLoader, context: Context) {
-        try {
-            refreshSettings(context)
-            val prefs = context.getSharedPreferences(Constants.PREFS_NAME, Context.MODE_PRIVATE)
-            val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-                if (key == Constants.PREF_ENABLE_AD_BLOCK || key == Constants.PREF_ENABLE_CHRONO_SORT) {
-                    refreshSettings(context)
-                }
-            }
-            prefsListener = listener
-            prefs.registerOnSharedPreferenceChangeListener(listener)
-        } catch (t: Throwable) {
-            Logger.w("Failed to init settings snapshot for NetworkTimelineHook", t)
-        }
-
         try {
             hookOkHttp(classLoader)
             hookRealCall(classLoader)
@@ -62,26 +43,23 @@ class NetworkTimelineHook : BaseHook() {
         }
     }
 
-    private fun refreshSettings(context: Context) {
-        try {
-            val prefs = context.getSharedPreferences(Constants.PREFS_NAME, Context.MODE_PRIVATE)
-            enableAdBlock = prefs.getBoolean(Constants.PREF_ENABLE_AD_BLOCK, true)
-            enableChronoSort = prefs.getBoolean(Constants.PREF_ENABLE_CHRONO_SORT, true)
-        } catch (_: Throwable) {
-        }
-    }
-
     private fun hookRealCall(classLoader: ClassLoader) {
         try {
             val realCallClass = classLoader.loadClass("okhttp3.internal.connection.RealCall")
             val hook = object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
-                    HostOkHttp.captureClient(param.thisObject)
                     try {
                         val req = XposedHelpers.getObjectField(param.thisObject, "originalRequest")
-                        if (req != null) {
-                            HostOkHttp.captureAuthFromRequest(req)
+                        val url = if (req != null) {
+                            XposedHelpers.callMethod(req, "url")?.toString()
+                        } else {
+                            null
                         }
+                        if (url != null) {
+                            HostOkHttp.captureClient(param.thisObject, url)
+                            onRequestUrl(url)
+                        }
+                        if (req != null) HostOkHttp.captureCookieFromRequest(req)
                     } catch (_: Throwable) {
                     }
                 }
@@ -96,6 +74,7 @@ class NetworkTimelineHook : BaseHook() {
                         }
                     } catch (t: Throwable) {
                         Logger.w("Error in RealCall hook: ${t.message}")
+                        if (t is IOException) throw t
                     }
                 }
             }
@@ -252,7 +231,9 @@ class NetworkTimelineHook : BaseHook() {
             return null
         }
 
-        if (!enableAdBlock && !enableChronoSort) {
+        val enableAdBlock = Settings.adBlock
+        val enableBypassSensitive = Settings.bypassSensitive
+        if (!enableAdBlock && !enableBypassSensitive) {
             return null
         }
 
@@ -275,17 +256,19 @@ class NetworkTimelineHook : BaseHook() {
         } catch (_: Throwable) { null }
         val isGzip = contentEncoding?.equals("gzip", ignoreCase = true) == true
 
-        var rawBytes: ByteArray? = null
-        try {
-            rawBytes = XposedHelpers.callMethod(body, "bytes") as? ByteArray
-            val bytes = rawBytes ?: return null
+        val bytes = try {
+            XposedHelpers.callMethod(body, "bytes") as? ByteArray
+        } catch (e: Throwable) {
+            throw IOException("timeline body read failed", e)
+        } ?: throw IOException("timeline body consumed but empty")
 
+        try {
             val rawJson = if (isGzip) {
                 try {
                     decompressGzip(bytes)
                 } catch (e: Throwable) {
                     Logger.w("Failed to decompress GZIP response, restoring original bytes", e)
-                    return rebuildResponse(response, classLoader, contentType, bytes, contentEncoding)
+                    return rebuildOrThrow(response, classLoader, contentType, bytes, contentEncoding)
                 }
             } else {
                 String(bytes, Charsets.UTF_8)
@@ -293,7 +276,7 @@ class NetworkTimelineHook : BaseHook() {
 
             val trimmed = rawJson.trimStart()
             if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
-                return rebuildResponse(response, classLoader, contentType, bytes, contentEncoding)
+                return rebuildOrThrow(response, classLoader, contentType, bytes, contentEncoding)
             }
 
             try {
@@ -305,29 +288,36 @@ class NetworkTimelineHook : BaseHook() {
             val processedJson = TimelineProcessor.processTimelineResponse(
                 rawJson = rawJson,
                 enableAdBlock = enableAdBlock,
-                enableChronoSort = enableChronoSort
+                enableBypassSensitive = enableBypassSensitive
             )
 
             if (processedJson == rawJson) {
-                return rebuildResponse(response, classLoader, contentType, bytes, contentEncoding)
+                return rebuildOrThrow(response, classLoader, contentType, bytes, contentEncoding)
             }
 
-            Logger.i("Purified and chronologically ordered timeline: $urlString")
+            Logger.d("Timeline response rewritten")
             val outBytes = if (isGzip) {
                 compressGzip(processedJson)
             } else {
                 processedJson.toByteArray(Charsets.UTF_8)
             }
             val outEncoding = if (isGzip) "gzip" else null
-            return rebuildResponse(response, classLoader, contentType, outBytes, outEncoding)
+            return rebuildOrThrow(response, classLoader, contentType, outBytes, outEncoding)
         } catch (e: Throwable) {
             Logger.e("Error processing timeline response: ${e.message}", e)
-            val fallback = rawBytes
-            if (fallback != null) {
-                return rebuildResponse(response, classLoader, contentType, fallback, contentEncoding)
-            }
-            return null
+            return rebuildOrThrow(response, classLoader, contentType, bytes, contentEncoding)
         }
+    }
+
+    private fun rebuildOrThrow(
+        response: Any,
+        classLoader: ClassLoader,
+        contentType: Any?,
+        bytes: ByteArray,
+        contentEncoding: String?
+    ): Any {
+        return rebuildResponse(response, classLoader, contentType, bytes, contentEncoding)
+            ?: throw IOException("timeline body already consumed and rebuild failed")
     }
 
     private fun shouldSkipContentType(typeStr: String?): Boolean {

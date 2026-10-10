@@ -5,15 +5,14 @@ import android.content.Context
 import com.polish.twitter.core.Constants
 import com.polish.twitter.core.DexKitManager
 import com.polish.twitter.core.Logger
-import com.polish.twitter.hooks.LogoLongPressHook
+import com.polish.twitter.core.Settings
+import com.polish.twitter.hooks.ActivityHooks
+import com.polish.twitter.hooks.HomeTabHook
 import com.polish.twitter.hooks.MediaDownloadHook
 import com.polish.twitter.hooks.NetworkTimelineHook
-import com.polish.twitter.hooks.SettingsHook
-import com.polish.twitter.hooks.TabSwitcherHook
-import com.polish.twitter.hooks.TimelineFilterHook
+import com.polish.twitter.utils.PlayerPlaybackTracker
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.util.concurrent.atomic.AtomicBoolean
@@ -44,10 +43,7 @@ class MainHook : IXposedHookLoadPackage {
                 Context::class.java,
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        val context = param.args[0] as Context
-                        val classLoader = lpparam.classLoader
-
-                        onContextAvailable(context, classLoader)
+                        onContextAvailable(param.args[0] as Context, lpparam.classLoader)
                     }
                 }
             )
@@ -61,40 +57,37 @@ class MainHook : IXposedHookLoadPackage {
             return
         }
         try {
-            Logger.i("Application context initialized. Starting DexKit and Hook subsystems...")
+            Settings.init(context)
 
-            val network = NetworkTimelineHook()
+            // 不依赖扫描的网络、播放、入口立即安装，避免错过宿主首个页面。
             val media = MediaDownloadHook()
-            val settings = SettingsHook()
-            // 不依赖扫描的网络、播放、快捷入口立即安装，避免错过宿主首个页面。
-            val activeHooks = listOf(network, media, TabSwitcherHook(), LogoLongPressHook(), settings)
+            val network = NetworkTimelineHook(media::notePlaybackIfVideo)
+            install("ActivityHooks") { ActivityHooks.install(media) }
+            install(network.name) { network.init(classLoader, context) }
+            install(media.name) { media.init(classLoader, context) }
 
-            // 3. 依次初始化并注册各业务 Hook（单个失败不阻塞其余）
-            for (hook in activeHooks) {
-                try {
-                    Logger.d("Initializing Hook: ${hook.name}...")
-                    hook.init(classLoader, context)
-                    Logger.i("Hook ${hook.name} initialized successfully.")
-                } catch (t: Throwable) {
-                    Logger.e("Failed to initialize Hook: ${hook.name}", t)
-                }
-            }
-
+            // 首页标签依赖混淆类，必须等 DexKit 结果；首页在 Application 之后才创建，来得及。
             DexKitManager.init(context, classLoader) {
-                val deferred = listOf<Pair<String, () -> Unit>>(
-                    "network" to { network.installDiscovered(classLoader) },
-                    "timeline model" to { TimelineFilterHook().init(classLoader, context) },
-                    "player" to { com.polish.twitter.utils.PlayerPlaybackTracker.installDiscovered(classLoader) },
-                    "settings" to { settings.installDiscovered(classLoader) }
-                )
-                deferred.forEach { (name, install) ->
-                    try { install() } catch (error: Throwable) { Logger.e("Deferred $name hook failed", error) }
+                install("network (DexKit)") { network.installDiscovered(classLoader) }
+                install("HomeTabHook") { HomeTabHook.installDiscovered(classLoader) }
+                install("PlayerTracker (DexKit)") {
+                    DexKitManager.exoPlayerImpl(classLoader)?.let { PlayerPlaybackTracker.hookImplClass(it) }
                 }
-                Logger.i("DexKit installation pass completed; runtime behavior remains unverified.")
+                Logger.i("DexKit pass done: ${DexKitManager.status}")
             }
         } catch (e: Throwable) {
             contextReady.set(false)
             Logger.e("Error during TwitterPolish context initialization", e)
+        }
+    }
+
+    /** 单个功能失败不阻塞其余功能。 */
+    private inline fun install(name: String, block: () -> Unit) {
+        try {
+            block()
+            Logger.i("Installed $name")
+        } catch (t: Throwable) {
+            Logger.e("Failed to install $name", t)
         }
     }
 }

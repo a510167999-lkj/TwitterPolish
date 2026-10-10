@@ -1,128 +1,94 @@
-# TwitterPolish - X (Twitter) LSPosed 增强模块
+# TwitterPolish
 
-<p align="center">
-  <b>适配 X 各种版本 · 屏蔽瀑布流所有广告 · 瀑布流纯时间序排列 · 视频与原图一键下载</b>
-</p>
+X（Twitter）Android 客户端的 LSPosed 模块：去掉时间线广告与推荐、默认进入「正在关注」、下载视频与原图。
 
----
+其他版本靠 DexKit 特征扫描适配，扫描不到的功能会自动停用并在设置面板里显示，不会乱挂。
 
-## 🌟 核心特性与实现原理
+## X 12.33.0 真机状态（2026-10-10，LSPosed v2.2.0，Android 16）
 
-### 1. 跨版本自适应 (Cross-Version Resilient)
-- **OkHttp 协议层拦截**：X 客户端无论界面如何混淆改名，底层网络通信始终采用标准 OkHttp。模块通过动态代理拦截 OkHttp 请求与响应链，在 GraphQL 响应进入 UI 渲染前直接净化 JSON，不受客户端混淆改版影响。
-- **DexKit 动态字节码检索与智能缓存**：
-  - 集成 `LuckyPray/DexKit`，在目标 APK 运行时通过特征字符串（如 `"promotedContent"`、`"video_info"`、`"HomeTimeline"`）动态定位目标类与方法；
-  - 配备本地签名缓存系统（根据 X 客户端 `versionCode` 持久化解析结果），冷启动 0 延迟，仅在 X 升级版本后自动触发重扫。
+| 功能 | 状态 |
+| --- | --- |
+| 默认进入「正在关注」 | ✅ 已验证：手动选「为你推荐」后冷启动仍进入「正在关注」 |
+| 长按顶部 X 图标打开设置 | ✅ 已验证 |
+| 悬浮球（显示 / 冷启动重新挂载 / 菜单 / 隐藏） | ✅ 已验证 |
+| 音量键不再被拦截 | ✅ 已验证 |
+| 全屏播放器长按下载视频 | ✅ 已验证：识别手指下的播放器，HLS 合成 MP4（720×1280 + AAC，时长与播放器一致） |
+| 复制链接下载原图 | ✅ 已验证：多图推文逐张保存 `name=orig` 原图（3072×4096） |
+| 去广告与推荐 | ⚠️ 已适配 12.33 响应格式，185 条真实条目无误删；尚未抓到真实广告样本验证删除效果 |
 
-### 2. 瀑布流广告全量屏蔽 (Timeline Ad-Blocking)
-- **推广推文 (Promoted Tweets)**：深度递归过滤带有 `promotedMetadata`、`promoted_metadata` 或 `promoted-tweet` 前缀的商业推广。
-- **关注推荐 (Who to follow)**：移除嵌入瀑布流中的推荐关注、猜你喜欢横条卡片。
-- **话题与趋势推荐 (Topics & Trends)**：移除 `topic-`、`connect-` 等非关注者的算法推荐卡片。
-- **模型层双重拦截**：通过 DexKit Hook 推文模型判断方法，强制 `isPromoted() -> false`，避免瀑布流出现空白占位或滑动掉帧。
+## 功能
 
-### 3. 瀑布流纯时间顺序排列 (Chronological Waterfall)
-- **Twitter Snowflake 时间戳算法**：
-  - 推文 ID 为 64 位 Snowflake ID，高 41 位表示时间戳（基于 Twitter Epoch `1288834974657L`）：
-    $$\text{Timestamp} = (\text{TweetId} \gg 22) + 1288834974657\text{ ms}$$
-  - Snowflake ID 具有绝对单调递增性（ID 越大 = 时间越新）。
-- **URT sortIndex 与 SQLite 数据库深度同步**：
-  - 剔除穿插在信息流中的陈旧推文，按 Snowflake ID 降序严格重排；
-  - 独家解决 X 客户端本地通过 `SELECT * FROM timeline_entry ORDER BY sort_index DESC` 读取时的算法回弹问题：重构每个条目的 `sortIndex` 降序键值并写回 JSON，确保客户端无论以何种方式渲染均为严格纯时间倒序；
-  - 完整保留并动态修正 `TimelineTimelineCursor`（顶部/底部加载游标），确保无限滑动加载流畅不断流。
+### 去广告与推荐
 
-### 4. 视频与图片最高清下载 (Media Downloading)
-- **无损原图**：将图片 CDN 链接（`pbs.twimg.com`）后缀一律转为 `name=orig`，直连官方无损母图。
-- **最高画质视频**：嗅探并 Hook 官方播放器 ExoPlayer，自动锁定最高码率 1080p MP4 直链。
-- **前台通知栏动态进度**：自建多线程下载引擎与专用通知渠道，实时输出百分比与 MB 传输量，下载后自动刷新系统相册。
-- **复制链接与悬浮球一键触发**：分享推文“复制链接”时自动提示下载，或通过屏幕悬浮球一键捕获当前播放的视频。
+时间线走 OkHttp，但 X 优先显示本地缓存，下拉刷新后才会发请求。模块在 OkHttp 上拦截时间线类 GraphQL 响应（首页、列表、个人页、推文详情、书签、搜索），在客户端渲染之前删除以下条目：
 
-### 5. 客户端内嵌控制台与悬浮齿轮 (In-App Settings & Quick Ball)
-- **屏幕边缘悬浮球（⚙️）**：应用内启动后吸附于屏幕边缘，可自由上下拖拽吸边，点击瞬间唤出快捷菜单与插件设置。
-- **双击音量减键快捷唤出**：物理按键极速呼出设置弹窗。
-- **官方设置集成**：在 X 原生“设置和支持 -> 设置与隐私”底部自动注入 TwitterPolish 选项。
+- 推广推文：`entryId` 带 promoted 前缀，`tweet_display_type` 为 `*PromotedTweet`，或任意层级出现**有值**的 `promotedMetadata` / `promoted_metadata` 等推广字段；
+- 推荐关注、话题与趋势推荐模块。
 
----
+只删除，不改其余条目的顺序。推文详情页的会话结构、书签的收藏顺序、搜索结果的排序都由服务端决定。
 
-## 📁 项目目录结构
+可选「自动展示敏感内容」：只清除敏感媒体警告字段，「不可用」「年龄限制」等其他插屏保留。
+
+### 默认进入「正在关注」
+
+关注流由服务端按时间倒序返回，本身就是纯时间线。X 有两处会把你送回「为你推荐」：
+
+1. 首页创建时，读取上次停留的标签，读不到就默认「为你推荐」；
+2. 远程开关 `android_home_back_open_for_you_on_app_restart_enabled`：在后台待了一段时间后回来，强制切回「为你推荐」。
+
+模块用 DexKit 定位这两处（锚点分别是字符串 `PreferredTabRepo` 和上述开关名），并让它们都落到「正在关注」。从外部链接指定了时间线的情况不受影响。修改该开关后需要重启 X 才生效。
+
+### 视频与原图下载
+
+- 视频：长按正在播放的视频画面，弹出下载菜单。模块读出手指下那块画面所属的播放器（12.33 起播放器类被混淆，用 DexKit 按 `ExoPlayerImpl` 日志 tag 定位），从播放器和 GraphQL 中找到这条视频的 HLS master 播放列表，选择最高分辨率的流，并用 MediaMuxer 把音视频合成为完整 MP4。认不出是哪条视频时直接提示，不会猜一条去下。
+- 图片：把 `pbs.twimg.com` 链接改写为 `name=orig`，下载原图。
+- 复制推文链接时，如果这条推文已经刷到过、并且有媒体，会弹出下载选择；纯文字推文不会弹。
+- 文件保存在 `Movies/Twitter/` 和 `Pictures/Twitter/`，通知栏显示下载进度。
+- 下载只允许 https 和 X 的媒体域名，凭据只会发给 X 自己的主机，重定向每一跳都重新校验。
+
+### 入口
+
+- **悬浮球**：可以拖动，松手后吸附到屏幕边缘；点击后可下载当前媒体或打开设置。在设置里可以隐藏。
+- **长按顶部 X 图标**：打开设置。
+
+## 安装
+
+1. 安装 APK，在 LSPosed 管理器中启用 TwitterPolish，并勾选作用域 X（`com.twitter.android`）。
+2. 强行停止 X 后重新打开。
+3. X 升级后第一次启动时，模块会在后台重新扫描（几秒钟），扫描结果按 X 版本缓存。
+
+LSPatch 免 Root 方式未经测试。
+
+## 构建与测试
+
+需要 JDK 17 和 Android SDK 34。
+
+```bash
+./gradlew testDebugUnitTest   # 单元测试
+./gradlew assembleDebug       # app/build/outputs/apk/debug/app-debug.apk
+```
+
+## 代码结构
 
 ```text
-TwitterPolish/
-├── app/
-│   ├── build.gradle.kts                         # 模块构建脚本
-│   ├── proguard-rules.pro                       # 混淆保持规则
-│   └── src/
-│       ├── main/
-│       │   ├── AndroidManifest.xml              # Xposed 模块声明与权限
-│       │   ├── assets/
-│       │   │   └── xposed_init                  # Xposed 入口指针
-│       │   ├── resources/META-INF/xposed/
-│       │   │   ├── module.prop                  # LSPosed 模块属性
-│       │   │   └── scope.list                   # 作用域声明 (com.twitter.android)
-│       │   └── java/com/polish/twitter/
-│       │       ├── MainHook.kt                  # Xposed 主入口 (IXposedHookLoadPackage)
-│       │       ├── core/
-│       │       │   ├── Constants.kt             # 全局常量与端点
-│       │       │   ├── Logger.kt                # 格式化日志
-│       │       │   └── DexKitManager.kt         # DexKit 动态扫描与签名缓存
-│       │       ├── hooks/
-│       │       │   ├── BaseHook.kt              # Hook 抽象基类
-│       │       │   ├── NetworkTimelineHook.kt   # OkHttp / GraphQL 响应拦截
-│       │       │   ├── TimelineFilterHook.kt    # 数据模型层去广告 Hook
-│       │       │   ├── MediaDownloadHook.kt     # 媒体下载长按与菜单注入
-│       │       │   └── TabSwitcherHook.kt       # 默认标签页管理
-│       │       ├── processor/
-│       │       │   ├── TimelineProcessor.kt     # 核心算法：广告清洗 + Snowflake 倒序重排
-│       │       │   └── MediaExtractor.kt        # 核心算法：1080p 视频与原图直链提取
-│       │       └── utils/
-│       │           ├── Downloader.kt            # DownloadManager 后台调度与相册刷新
-│       │           └── SnowflakeUtils.kt        # Snowflake 时间戳解析转换
-│       └── test/java/com/polish/twitter/
-│           └── TimelineProcessorTest.kt         # 单元测试 (去广告、排序、媒体解析)
-├── gradle/wrapper/
-│   └── gradle-wrapper.properties
-├── build.gradle.kts
-├── settings.gradle.kts
-└── gradlew
+app/src/main/java/com/polish/twitter/
+├── MainHook.kt                 # 入口：只接管 X 主进程，按功能隔离安装
+├── core/
+│   ├── DexKitManager.kt        # 特征扫描 + 结构校验 + 按 X 版本缓存
+│   ├── MethodTarget.kt         # JVM 方法描述符解析
+│   ├── Settings.kt             # 开关快照（热路径不读 SharedPreferences）
+│   ├── XHost.kt                # 宿主 Activity 名单
+│   ├── Constants.kt / Logger.kt
+├── hooks/
+│   ├── NetworkTimelineHook.kt  # OkHttp 拦截器 + RealCall，网络层唯一入口
+│   ├── HomeTabHook.kt          # 默认进入正在关注
+│   ├── ActivityHooks.kt        # onResume / dispatchTouchEvent 唯一挂点，分发 Logo 长按与视频长按
+│   └── MediaDownloadHook.kt    # 播放器追踪、视频长按、复制链接
+├── processor/
+│   ├── TimelineProcessor.kt    # 去广告、敏感媒体标志
+│   ├── MediaExtractor.kt / MediaCache.kt / HlsPlaylistParser.kt
+├── utils/                      # 下载、HLS 合成、下载安全校验、播放器追踪
+└── ui/                         # 设置面板、悬浮球
 ```
 
----
-
-## 🔨 构建与安装
-
-### 1. 命令行构建
-```bash
-# 赋予 gradlew 执行权限（若需要）
-chmod +x gradlew
-
-# 编译 Debug APK
-./gradlew assembleDebug
-
-# 或编译 Release APK
-./gradlew assembleRelease
-```
-生成的 APK 路径：`app/build/outputs/apk/debug/app-debug.apk`。
-
-### 2. 在 Android Studio / IDE 中使用
-- 直接通过 Android Studio 打开 `TwitterPolish` 目录。
-- 等待 Gradle 同步完成，点击 `Build > Build Bundle(s) / APK(s) > Build APK(s)` 即可完成构建。
-
----
-
-## 📱 使用指南
-
-### 1. Root 用户 (LSPosed)
-1. 在手机上安装编译生成的 `TwitterPolish` APK。
-2. 打开 **LSPosed 管理器**，在模块列表中找到 **TwitterPolish**。
-3. 勾选启用该模块，并确认推荐作用域已勾选 **X (`com.twitter.android`)**。
-4. 强行停止 X (Twitter) 客户端并重新打开。
-
-### 2. 免 Root 用户 (LSPatch)
-1. 安装 **LSPatch** 工具应用。
-2. 提取或准备好官方 X 客户端 APK。
-3. 在 LSPatch 中新建修补，选择 X 客户端，并在便携模式（Portable）或本地模式中嵌入 `TwitterPolish` 模块。
-4. 卸载原版 X，安装修补后的 APK 即可免 Root 享受所有功能。
-
-### 3. 操作说明
-- **广告拦截**：打开 X 客户端进入主页流，所有推广推文、推荐关注模块已自动被彻底过滤。
-- **纯时间倒序**：主页瀑布流推文已自动按照真实发布时间倒序排列，最新推文始终在最前。
-- **视频与图片下载**：在推文中**长按**任意图片或视频，屏幕将弹出下载确认对话框，点击“立即下载”即由系统后台调度下载并自动存入相册。
+决策记录在 `active/` 目录下。

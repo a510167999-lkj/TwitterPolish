@@ -1,5 +1,6 @@
 package com.polish.twitter
 
+import com.polish.twitter.processor.HlsPlaylistParser
 import com.polish.twitter.processor.MediaCache
 import com.polish.twitter.processor.MediaExtractor
 import org.json.JSONObject
@@ -493,5 +494,70 @@ class MediaCacheTest {
             fromPlayer = false
         )
         assertEquals("锁过期后新视频必须能更新 currentMediaId", idB, MediaCache.currentMediaId)
+    }
+
+    @Test
+    fun copiedLinkOfTextOnlyTweetNeverResolvesToThePlayingVideo() {
+        // WHY: 复制链接会弹下载选择。若查不到这条推文就回落到“当前在播”，
+        // 复制一条纯文字推文会弹出另一个视频的下载，用户会存错文件。
+        MediaCache.ingestJson(
+            """{"__typename":"Tweet","rest_id":"2222222222222222222","legacy":{"extended_entities":{"media":[""" +
+                """{"id_str":"1000000000000000002","type":"video","video_info":{"variants":[""" +
+                """{"content_type":"application/x-mpegURL","url":"https://video.twimg.com/ext_tw_video/1000000000000000002/pu/pl/masterB.m3u8"}""" +
+                """]}}]}}}"""
+        )
+        MediaCache.notePlaybackUrl(
+            "https://video.twimg.com/ext_tw_video/1000000000000000002/pu/pl/masterB.m3u8",
+            fromPlayer = true
+        )
+
+        assertTrue("纯文字推文没有缓存媒体，必须是空", MediaCache.forTweet("3333333333333333333").isEmpty())
+        assertEquals(1, MediaCache.forTweet("2222222222222222222").size)
+    }
+
+    /** 12.33 真机响应的结构（字段与层级照抄 HomeTimeline 抓包，内容裁剪）。 */
+    private fun x1233Tweet(): JSONObject = JSONObject(
+        """
+        {"data":{"timeline_response":{"timeline":{"instructions":[{"__typename":"TimelineAddEntries","entries":[
+          {"entry_id":"tweet-2108808672331915459","sort_index":"1","content":{"__typename":"TimelineTimelineItem",
+           "content":{"__typename":"TimelineTweet","tweet_display_type":"Tweet","tweet_results":{"result":{
+             "__typename":"Tweet","rest_id":"2108808672331915459",
+             "core":{"user_results":{"result":{"__typename":"User","rest_id":"1500000000000000001"}}},
+             "details":{"full_text":"x"},
+             "media_entities":[
+               {"id_str":"2108808547836493824","media_results":{"result":{"__typename":"ApiMedia",
+                 "media_id":"2108808547836493824",
+                 "media_info":{"__typename":"ApiVideo","duration_millis":44776,"variants":[
+                   {"bit_rate":632000,"content_type":"video/mp4","url":"https://video.twimg.com/amplify_video/2108808547836493824/vid/avc1/320x568/a.mp4"},
+                   {"bit_rate":2176000,"content_type":"video/mp4","url":"https://video.twimg.com/amplify_video/2108808547836493824/vid/avc1/720x1278/b.mp4"},
+                   {"content_type":"application/x-mpegURL","url":"https://video.twimg.com/amplify_video/2108808547836493824/pl/6HOv3JLP3PAn2mWu.m3u8"}]}}}},
+               {"id_str":"2108808547836493825","media_results":{"result":{"__typename":"ApiMedia",
+                 "media_id":"2108808547836493825",
+                 "media_info":{"__typename":"ApiImage","original_img_height":1892,"original_img_width":2088,
+                   "original_img_url":"https://pbs.twimg.com/media/HUP_brKacAA42N2.jpg"}}}}
+             ]}}}}}
+        ]}]}}}}
+        """.trimIndent()
+    )
+
+    @Test
+    fun x1233PhotosAreCollectedAsOriginals() {
+        // 12.33 的图片只有 ApiImage.original_img_url，没有 type=photo / media_url_https；
+        // 不认这个结构，复制链接和悬浮球就永远拿不到原图。
+        MediaCache.ingestObject(x1233Tweet())
+        val photo = MediaCache.forTweet("2108808672331915459").single { !it.isVideo }
+        assertEquals("https://pbs.twimg.com/media/HUP_brKacAA42N2.jpg?name=orig", photo.url)
+        assertEquals("2108808547836493825", photo.mediaId)
+    }
+
+    @Test
+    fun x1233VideoIsKeyedByItsOwnMediaIdAndUsesTheMaster() {
+        // 长按从播放器拿到的是 media_id；GraphQL 这条必须能按它查到，且给 master 以便选 1080p。
+        MediaCache.ingestObject(x1233Tweet())
+        val video = MediaCache.resolve(mediaId = "2108808547836493824").first()
+        assertTrue(video.isVideo)
+        assertEquals("2108808672331915459", video.tweetId)
+        assertTrue(HlsPlaylistParser.isMasterPlaylistUrl(video.url))
+        assertEquals("bit_rate 也要读到，否则多档 progressive 之间比不出高低", 2176000L, video.bitrate)
     }
 }

@@ -2,7 +2,6 @@ package com.polish.twitter
 
 import com.polish.twitter.processor.MediaExtractor
 import com.polish.twitter.processor.TimelineProcessor
-import com.polish.twitter.utils.SnowflakeUtils
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -14,19 +13,7 @@ import org.junit.Test
 class TimelineProcessorTest {
 
     @Test
-    fun testSnowflakeTimestampCalculation() {
-        val olderId = 1700000000000000000L
-        val newerId = 1800000000000000000L
-
-        val olderTime = SnowflakeUtils.getTimestamp(olderId)
-        val newerTime = SnowflakeUtils.getTimestamp(newerId)
-
-        assertTrue("Newer Tweet ID must yield a later timestamp", newerTime > olderTime)
-        assertTrue("Timestamp should be after Twitter epoch", olderTime > SnowflakeUtils.TWITTER_EPOCH)
-    }
-
-    @Test
-    fun testAdFilteringAndChronologicalOrdering() {
+    fun adsAreRemovedAndServerOrderIsKept() {
         val rawJson = """
         {
           "data": {
@@ -114,13 +101,11 @@ class TimelineProcessorTest {
         val addEntries = instructions.getJSONObject(0)
         val entries = addEntries.getJSONArray("entries")
 
-        // 预期保留条目：cursor-top, tweet-1800000000000000000 (新), tweet-1700000000000000000 (旧), cursor-bottom
-        assertEquals(4, entries.length())
-
-        assertEquals("cursor-top-1", entries.getJSONObject(0).getString("entryId"))
-        assertEquals("tweet-1800000000000000000", entries.getJSONObject(1).getString("entryId")) // 最新推文排在前面！
-        assertEquals("tweet-1700000000000000000", entries.getJSONObject(2).getString("entryId")) // 较旧推文排在后面
-        assertEquals("cursor-bottom-2", entries.getJSONObject(3).getString("entryId"))
+        // WHY: 只删广告与推荐，不动顺序。旧版按 ID 重排会把详情页回复顶到主推文上面。
+        assertEquals(
+            listOf("cursor-top-1", "tweet-1700000000000000000", "tweet-1800000000000000000", "cursor-bottom-2"),
+            entryIds(entries)
+        )
     }
 
     @Test
@@ -178,68 +163,45 @@ class TimelineProcessorTest {
     }
 
     @Test
-    fun testSortIndexSyncingAndEntryIdVariants() {
-        val rawJson = """
-        {
-          "instructions": [
-            {
-              "type": "TimelineAddEntries",
-              "entries": [
-                {
-                  "entryId": "cursor-top",
-                  "sortIndex": "9999999999999999999",
-                  "content": { "entryType": "TimelineTimelineCursor", "cursorType": "Top" }
-                },
-                {
-                  "entryId": "home-conversation-1700000000000000000",
-                  "sortIndex": "5000",
-                  "content": {
-                    "itemContent": {
-                      "tweet_results": {
-                        "result": {
-                          "__typename": "TweetWithVisibilityResults",
-                          "tweet": { "rest_id": "1700000000000000000" }
-                        }
-                      }
-                    }
-                  }
-                },
-                {
-                  "entryId": "sq-I-t-1900000000000000000",
-                  "sortIndex": "4000",
-                  "content": {
-                    "itemContent": {
-                      "tweet_results": { "result": { "rest_id": "1900000000000000000" } }
-                    }
-                  }
-                },
-                {
-                  "entryId": "cursor-bottom",
-                  "sortIndex": "1000",
-                  "content": { "entryType": "TimelineTimelineCursor", "cursorType": "Bottom" }
-                }
-              ]
-            }
-          ]
-        }
-        """.trimIndent()
+    fun tweetDetailConversationOrderIsUntouched() {
+        // WHY: 详情页顺序是“上文 → 主推文 → 回复”，回复 ID 一定比主推文大。
+        // 任何按 ID 的重排都会把回复顶到主推文上方、上文沉到底部，会话结构就坏了。
+        val raw = """{"data":{"threaded_conversation_with_injections_v2":{"instructions":[{"type":"TimelineAddEntries","entries":[""" +
+            """{"entryId":"tweet-1700000000000000000","sortIndex":"9","content":{"entryType":"TimelineTimelineItem"}},""" +
+            """{"entryId":"tweet-1750000000000000000","sortIndex":"8","content":{"entryType":"TimelineTimelineItem"}},""" +
+            """{"entryId":"promoted-tweet-1","content":{"entryType":"TimelineTimelineItem"}},""" +
+            """{"entryId":"conversationthread-1790000000000000000","sortIndex":"7","content":{"entryType":"TimelineTimelineModule"}},""" +
+            """{"entryId":"conversationthread-1780000000000000000","sortIndex":"6","content":{"entryType":"TimelineTimelineModule"}}""" +
+            """]}]}}}"""
+        val entries = JSONObject(TimelineProcessor.processTimelineResponse(raw))
+            .getJSONObject("data").getJSONObject("threaded_conversation_with_injections_v2")
+            .getJSONArray("instructions").getJSONObject(0).getJSONArray("entries")
 
-        val processed = TimelineProcessor.processTimelineResponse(rawJson)
-        val root = JSONObject(processed)
-        val entries = root.getJSONArray("instructions").getJSONObject(0).getJSONArray("entries")
+        assertEquals(
+            listOf(
+                "tweet-1700000000000000000",
+                "tweet-1750000000000000000",
+                "conversationthread-1790000000000000000",
+                "conversationthread-1780000000000000000"
+            ),
+            entryIds(entries)
+        )
+        assertEquals("sortIndex 也不能被改写", "9", entries.getJSONObject(0).getString("sortIndex"))
+    }
 
-        assertEquals(4, entries.length())
+    @Test
+    fun nullPromotedPlaceholderDoesNotDropOrganicTweet() {
+        // WHY: 普通推文也可能带推广字段的空占位。只看 key 名会把正常推文整条删掉。
+        val raw = """{"instructions":[{"type":"TimelineAddEntries","entries":[""" +
+            """{"entryId":"tweet-1700000000000000000","content":{"entryType":"TimelineTimelineItem","itemContent":""" +
+            """{"promotedMetadata":null,"tweet_results":{"result":{"rest_id":"1700000000000000000","legacy":{"is_promoted":false}}}}}},""" +
+            """{"entryId":"tweet-1800000000000000000","content":{"entryType":"TimelineTimelineItem","itemContent":""" +
+            """{"promotedMetadata":{"impressionId":"x"},"tweet_results":{"result":{"rest_id":"1800000000000000000"}}}}}""" +
+            """]}]}"""
+        val entries = JSONObject(TimelineProcessor.processTimelineResponse(raw))
+            .getJSONArray("instructions").getJSONObject(0).getJSONArray("entries")
 
-        val tweet1 = entries.getJSONObject(1)
-        val tweet2 = entries.getJSONObject(2)
-
-        // 验证最新发布的推文（1900...）排在前面
-        assertEquals("sq-I-t-1900000000000000000", tweet1.getString("entryId"))
-        assertEquals("home-conversation-1700000000000000000", tweet2.getString("entryId"))
-
-        // 验证 sortIndex 也完成了降序重构同步（第一条分配较高的 5000，第二条分配较低的 4000）
-        assertEquals("5000", tweet1.getString("sortIndex"))
-        assertEquals("4000", tweet2.getString("sortIndex"))
+        assertEquals("只删带真实推广元数据的那条", listOf("tweet-1700000000000000000"), entryIds(entries))
     }
 
     @Test
@@ -281,22 +243,185 @@ class TimelineProcessorTest {
     }
 
     @Test
-    fun noRewriteWhenNothingToStripAndSortDisabled() {
-        // WHY: 网络层会 bytes() 耗尽响应体。无广告且关闭时间序时必须返回同一字符串实例，
+    fun noRewriteWhenNothingToStrip() {
+        // WHY: 网络层会 bytes() 耗尽响应体。无广告时必须返回同一字符串实例，
         // 这样拦截器走 restoreOriginal（原字节重建），而不是 JSONObject.toString() 改 key 序。
         // 若这里仍改写，改写失败就会把已消耗的 body 交回客户端，下拉刷新一直转。
         val raw = """{"instructions":[{"type":"TimelineAddEntries","entries":[""" +
             """{"entryId":"tweet-1700000000000000000","content":{"entryType":"TimelineTimelineItem",""" +
             """"itemContent":{"tweet_results":{"result":{"rest_id":"1700000000000000000"}}}}},""" +
             """{"entryId":"cursor-bottom-1","content":{"entryType":"TimelineTimelineCursor","cursorType":"Bottom"}}]}]}"""
+        val out = TimelineProcessor.processTimelineResponse(raw, enableAdBlock = true)
+        assertTrue(
+            "无广告时应返回原字符串实例，避免无意义改写",
+            out === raw
+        )
+    }
+
+    @Test
+    fun testBypassSensitiveContentWarning() {
+        val raw = """
+        {
+          "instructions": [
+            {
+              "type": "TimelineAddEntries",
+              "entries": [
+                {
+                  "entryId": "tweet-1800000000000000000",
+                  "content": {
+                    "entryType": "TimelineTimelineItem",
+                    "itemContent": {
+                      "itemType": "TimelineTweet",
+                      "tweet_results": {
+                        "result": {
+                          "rest_id": "1800000000000000000",
+                          "tweetInterstitial": {
+                            "interstitial_type": "SensitiveMediaWarning"
+                          },
+                          "sensitive_media_warning": {
+                            "adult_content": true
+                          },
+                          "ext_sensitive_media_warning": {
+                            "adult_content": true
+                          },
+                          "legacy": {
+                            "possibly_sensitive": true,
+                            "possibly_sensitive_editable": true
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+        """.trimIndent()
+
+        val processed = TimelineProcessor.processTimelineResponse(
+            raw,
+            enableAdBlock = false,
+            enableBypassSensitive = true
+        )
+
+        val root = JSONObject(processed)
+        val tweetResult = root.getJSONArray("instructions")
+            .getJSONObject(0)
+            .getJSONArray("entries")
+            .getJSONObject(0)
+            .getJSONObject("content")
+            .getJSONObject("itemContent")
+            .getJSONObject("tweet_results")
+            .getJSONObject("result")
+
+        // WHY: 媒体警告要去掉，但 tweetInterstitial 还承担不可用/年龄等插屏，不能整棵删掉。
+        assertTrue("tweetInterstitial 应保留", tweetResult.has("tweetInterstitial"))
+        assertFalse("sensitive_media_warning 应被移除", tweetResult.has("sensitive_media_warning"))
+        assertFalse("ext_sensitive_media_warning 应被移除", tweetResult.has("ext_sensitive_media_warning"))
+
+        val legacy = tweetResult.getJSONObject("legacy")
+        assertFalse("possibly_sensitive 应被置为 false", legacy.getBoolean("possibly_sensitive"))
+        assertFalse("possibly_sensitive_editable 应被置为 false", legacy.getBoolean("possibly_sensitive_editable"))
+    }
+
+    @Test
+    fun bypassSensitiveDoesNotRewriteWhenNoFlagsPresent() {
+        // WHY: 开关打开时若仍 JSONObject.toString()，无标志的时间线也会被改 key 序。
+        val raw = """{"instructions":[{"type":"TimelineAddEntries","entries":[{"entryId":"tweet-1700000000000000000","content":{"entryType":"TimelineTimelineItem","itemContent":{"tweet_results":{"result":{"rest_id":"1700000000000000000","legacy":{"full_text":"hello"}}}}}}]}]}"""
         val out = TimelineProcessor.processTimelineResponse(
             raw,
-            enableAdBlock = true,
-            enableChronoSort = false
+            enableAdBlock = false,
+            enableBypassSensitive = true
         )
-        assertTrue(
-            "无广告且关闭排序时应返回原字符串实例，避免无意义改写",
-            out === raw
+        assertTrue(out === raw)
+    }
+
+    @Test
+    fun bypassSensitiveKeepsNonMediaInterstitial() {
+        val raw = """{"tweetInterstitial":{"interstitial_type":"Unavailable"},"legacy":{"possibly_sensitive":false}}"""
+        val out = TimelineProcessor.processTimelineResponse(
+            raw,
+            enableAdBlock = false,
+            enableBypassSensitive = true
+        )
+        assertTrue(out === raw)
+    }
+
+    private fun entryIds(entries: JSONArray): List<String> =
+        (0 until entries.length()).map { entries.getJSONObject(it).getString("entryId") }
+
+    // ---- X Android 12.33 的 Apollo 响应：下划线命名，结构取自真机抓包（内容为虚构） ----
+
+    private fun x1233Tweet(id: String, extraContent: String = "", resultExtra: String = "") =
+        """{"entry_id":"tweet-$id","sort_index":"$id","content":{"__typename":"TimelineTimelineItem",""" +
+            """"client_event_info":{"component":"for_you_in_network"},"content":{"__typename":"TimelineTweet",""" +
+            """"tweet_display_type":"Tweet",$extraContent"tweet_results":{"rest_id":"$id","result":{"__typename":"Tweet"$resultExtra}}}}}"""
+
+    private fun x1233Home(vararg entries: String) =
+        """{"data":{"timeline_response":{"id":"x","timeline":{"instructions":[{"__typename":"TimelineClearCache"},""" +
+            """{"__typename":"TimelineAddEntries","entries":[${entries.joinToString(",")}]}]}}}}"""
+
+    private fun x1233Entries(json: String): JSONArray =
+        JSONObject(json).getJSONObject("data").getJSONObject("timeline_response").getJSONObject("timeline")
+            .getJSONArray("instructions").getJSONObject(1).getJSONArray("entries")
+
+    private fun x1233Ids(entries: JSONArray) =
+        (0 until entries.length()).map { entries.getJSONObject(it).getString("entry_id") }
+
+    @Test
+    fun x1233PromotedTweetIsRemoved() {
+        // WHY: 12.33 的推广推文 entry_id 与普通推文一样是 tweet-<id>，前缀规则认不出；
+        // 只能靠 content.content 下有值的 promoted_metadata。前后两条普通推文必须原序保留。
+        val raw = x1233Home(
+            x1233Tweet("1800000000000000001"),
+            x1233Tweet(
+                "1800000000000000002",
+                extraContent = """"promoted_metadata":{"advertiser_results":{"rest_id":"9"},"impression_id":"abc"},"""
+            ),
+            x1233Tweet("1800000000000000003")
+        )
+        assertEquals(
+            listOf("tweet-1800000000000000001", "tweet-1800000000000000003"),
+            x1233Ids(x1233Entries(TimelineProcessor.processTimelineResponse(raw)))
+        )
+    }
+
+    @Test
+    fun x1233PromotedDisplayTypeIsRemoved() {
+        // WHY: 推广推文的展示类型是 *PromotedTweet；即使 promoted_metadata 被裁剪，也要能认出来。
+        val promoted = x1233Tweet("1800000000000000002")
+            .replace(""""tweet_display_type":"Tweet"""", """"tweet_display_type":"CompactPromotedTweet"""")
+        val raw = x1233Home(x1233Tweet("1800000000000000001"), promoted)
+        assertEquals(
+            listOf("tweet-1800000000000000001"),
+            x1233Ids(x1233Entries(TimelineProcessor.processTimelineResponse(raw)))
+        )
+    }
+
+    @Test
+    fun authorPaidPromotionDisclosureIsNotAnAd() {
+        // WHY: content_disclosure.advertising_disclosure.is_paid_promotion 是作者自己声明的付费推广，
+        // 是关注对象的正常推文，不是 X 投放的广告。真机抓包里就有一条，旧规则把它误删了。
+        val raw = x1233Home(
+            x1233Tweet(
+                "1800000000000000001",
+                resultExtra = ""","content_disclosure":{"advertising_disclosure":{"is_paid_promotion":true}}"""
+            )
+        )
+        val out = TimelineProcessor.processTimelineResponse(raw)
+        assertTrue("没有广告时应原样返回", out === raw)
+    }
+
+    @Test
+    fun x1233WhoToFollowModuleIsRemoved() {
+        // WHY: 12.33 的模块类型在 __typename、事件信息在 client_event_info；只认驼峰字段会漏掉推荐关注横栏。
+        val module = """{"entry_id":"module-1","sort_index":"1","content":{"__typename":"TimelineTimelineModule",""" +
+            """"client_event_info":{"component":"suggest_who_to_follow"},"items":[]}}"""
+        val raw = x1233Home(x1233Tweet("1800000000000000001"), module)
+        assertEquals(
+            listOf("tweet-1800000000000000001"),
+            x1233Ids(x1233Entries(TimelineProcessor.processTimelineResponse(raw)))
         )
     }
 }

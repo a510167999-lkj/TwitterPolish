@@ -94,7 +94,7 @@ class HlsPlaylistParserTest {
             "https://video.twimg.com/amplify_video/2093578924810960896/pl/mp4a/32000/aud.m3u8",
             "https://video.twimg.com/amplify_video/2093578924810960896/vid/avc1/57000/60000/720x1280/seg.m4s"
         )
-        val picked = ExoCacheProbe.pickFromKeys(keys)!!
+        val picked = ExoCacheProbe.pickFromKeys(keys, "2093578924810960896")!!
         assertEquals("2093578924810960896", picked.mediaId)
         assertTrue(
             "Must use master so the downloader can pick 1080p instead of the playing 720p ladder",
@@ -112,9 +112,21 @@ class HlsPlaylistParserTest {
             "https://video.twimg.com/amplify_video/2093578924810960896/pl/mp4a/128000/aud.m3u8",
             "https://video.twimg.com/amplify_video/2093578924810960896/vid/avc1/57000/60000/720x1280/seg.m4s"
         )
-        val picked = ExoCacheProbe.pickFromKeys(keys)!!
+        val picked = ExoCacheProbe.pickFromKeys(keys, "2093578924810960896")!!
         assertTrue(picked.url.contains("/pl/avc1/720x1280/"))
         assertTrue(picked.hlsAudioUrl.contains("/pl/mp4a/128000/"))
+    }
+
+    @Test
+    fun exoCacheNeverGuessesTheLatestCachedVideoWhenThePlayerIsUnknown() {
+        // 真机 12.33：长按认不出播放器时回落到「缓存里最后一条」，不同视频都下成了同一条
+        // 已删除的视频，播放列表 404。不知道是哪条视频，就不能从缓存里挑一条。
+        val keys = listOf(
+            "https://video.twimg.com/amplify_video/2108796446237687808/pl/hm-G-EyLhrHUUV4X.m3u8",
+            "https://video.twimg.com/amplify_video/2108796446237687808/pl/avc1/720x1280/x.m3u8"
+        )
+        assertNull(ExoCacheProbe.pickFromKeys(keys, null))
+        assertNull(ExoCacheProbe.pickFromKeys(keys, ""))
     }
 
     @Test
@@ -152,6 +164,26 @@ class HlsPlaylistParserTest {
             HlsPlaylistParser.isMasterPlaylistUrl(merged[0].url)
         )
         assertEquals("2056623384482783650", merged[0].tweetId)
+    }
+
+    @Test
+    fun downloadResolverDoesNotTreatBlankMediaIdsAsTheSameVideo() {
+        val item = ExtractedMedia(
+            url = "https://video.twimg.com/a.mp4",
+            isVideo = true,
+            fileName = "a.mp4"
+        )
+        val hls = ExtractedMedia(
+            url = "https://video.twimg.com/b/pl/master.m3u8",
+            isVideo = true,
+            fileName = "b.mp4"
+        )
+        val merged = DownloadResolver.merge(listOf(item), hls, null)
+        assertEquals(
+            "缺少 mediaId 时不能把两条视频当成同一条",
+            item.url,
+            merged.single().url
+        )
     }
 
     @Test

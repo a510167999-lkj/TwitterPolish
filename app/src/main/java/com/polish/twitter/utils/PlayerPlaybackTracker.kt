@@ -1,12 +1,12 @@
 package com.polish.twitter.utils
 
+import android.app.Activity
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
-import com.polish.twitter.core.DexKitManager
 import com.polish.twitter.core.Logger
 import com.polish.twitter.processor.MediaCache
 import com.polish.twitter.processor.MediaExtractor
@@ -14,6 +14,7 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import java.lang.ref.WeakReference
+import java.lang.reflect.Field
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 import java.lang.reflect.Proxy
@@ -23,14 +24,16 @@ import java.util.WeakHashMap
 /**
  * 沉浸式播放器同时活着多个 ExoPlayer。
  * 长按必须跟「手指下面那块 Surface」绑定，不能信任意 CDN 请求或上一个渲染过的播放器。
+ *
+ * 画面→播放器的对应关系在长按那一刻现读：播放器内部保存着当前输出（Surface / SurfaceHolder /
+ * TextureView），按字段类型扫出来和手指下的视图做身份比对。X 12.33 把 setVideoSurface* 与
+ * clearVideoSurface* 都混淆成单字母且签名相同，靠挂方法分不清设置还是清除，读状态才可靠。
  */
 object PlayerPlaybackTracker {
 
     private val players = Collections.synchronizedMap(WeakHashMap<Any, Boolean>())
-    private val hookedClasses = Collections.synchronizedSet(mutableSetOf<String>())
     private val listening = Collections.synchronizedMap(WeakHashMap<Any, Boolean>())
-    private val outputToPlayer = Collections.synchronizedMap(WeakHashMap<Any, WeakReference<Any>>())
-    private val playerToOutput = Collections.synchronizedMap(WeakHashMap<Any, WeakReference<Any>>())
+    private val outputFieldCache = Collections.synchronizedMap(HashMap<Class<*>, List<Field>>())
 
     @Volatile
     private var lastRendered: WeakReference<Any>? = null
@@ -41,15 +44,18 @@ object PlayerPlaybackTracker {
     fun hook(classLoader: ClassLoader) {
         this.classLoader = classLoader
         hookNamedBuilders(classLoader)
-        hookDexKitImpl(classLoader)
-        hookExoInterface(classLoader)
         hookPlayerView(classLoader)
+    }
+
+    /** DexKit 找到的播放器实现类（混淆后的 ExoPlayerImpl）：构造即登记。 */
+    fun hookImplClass(clazz: Class<*>) {
+        XposedBridge.hookAllConstructors(clazz, attachCtor)
+        Logger.i("PlayerTracker hooked ${clazz.name} constructors")
     }
 
     fun attach(player: Any?) {
         if (player == null) return
         players[player] = true
-        hookConcrete(player.javaClass)
         addListener(player)
     }
 
@@ -57,17 +63,22 @@ object PlayerPlaybackTracker {
      * 长按：只认按到的那块画面所属播放器。认不出返回 null，由调用方决定要不要降级。
      */
     fun syncViewIntoCache(view: View): String? {
-        val player = playerForView(view) ?: return null
-        val uri = uriFromPlayer(player) ?: return null
+        val player = playerForView(view)
+        if (player == null) {
+            Logger.i("Long-press: no player for ${view.javaClass.name}; live players=${players.size}")
+            return null
+        }
+        val uri = uriFromPlayer(player)
+        val id = uri?.let { MediaExtractor.extractMediaId(it) }
+        Logger.i("Long-press view=${view.javaClass.simpleName} ${view.width}x${view.height} media=$id")
+        if (uri == null || id == null) return null
         MediaCache.notePlaybackUrl(uri, fromPlayer = true)
         lastRendered = WeakReference(player)
-        val id = MediaExtractor.extractMediaId(uri)
-        Logger.i("Long-press view=${view.javaClass.simpleName} ${view.width}x${view.height} media=$id")
         return id
     }
 
-    fun syncPlayingIntoCache(): String? {
-        val player = selectPlayer() ?: return null
+    fun syncPlayingIntoCache(activity: Activity?): String? {
+        val player = selectPlayer(activity) ?: return null
         val uri = uriFromPlayer(player) ?: return null
         MediaCache.notePlaybackUrl(uri, fromPlayer = true)
         val id = MediaExtractor.extractMediaId(uri)
@@ -75,71 +86,38 @@ object PlayerPlaybackTracker {
         return id
     }
 
+    /** 手指下的视图本身或它的子树里，有哪块画面正被某个播放器输出。 */
     fun playerForView(view: View): Any? {
-        var node: View? = view
-        while (node != null) {
-            lookupViewKeys(node)?.let { return it }
-            val parent = node.parent
-            node = parent as? View
-        }
-        return findInChildren(view)
-    }
-
-    private fun lookupViewKeys(view: View): Any? {
-        lookupOutput(view)?.let { return it }
-        if (view is SurfaceView) {
-            lookupOutput(view.holder)?.let { return it }
-            try {
-                view.holder.surface?.let { lookupOutput(it) }?.let { return it }
-            } catch (_: Throwable) {
-            }
-        }
-        if (view is TextureView) {
-            try {
-                view.surfaceTexture?.let { lookupOutput(it) }?.let { return it }
-            } catch (_: Throwable) {
-            }
-        }
-        return null
-    }
-
-    private fun findInChildren(view: View): Any? {
-        if (view !is ViewGroup) return null
-        for (i in 0 until view.childCount) {
-            val child = view.getChildAt(i)
-            lookupViewKeys(child)?.let { return it }
-            findInChildren(child)?.let { return it }
-        }
-        return null
-    }
-
-    private fun lookupOutput(key: Any?): Any? {
-        if (key == null) return null
-        return outputToPlayer[key]?.get()
-    }
-
-    private fun selectPlayer(): Any? {
         val live = synchronized(players) { players.keys.toList() }
-        val onScreen = live.mapNotNull { player ->
-            val view = outputView(player) ?: return@mapNotNull null
-            if (!isOnScreen(view)) return@mapNotNull null
-            Triple(player, isPlaying(player), view.width.toLong() * view.height.toLong())
+        if (live.isEmpty()) return null
+        for (candidate in listOf(view) + videoLikeViews(view)) {
+            val keys = outputKeys(candidate)
+            live.firstOrNull { player -> currentOutputs(player).any { out -> keys.any { it === out } } }
+                ?.let { return it }
         }
-        val playingVisible = onScreen.filter { it.second }
-        val pool = if (playingVisible.isNotEmpty()) playingVisible else onScreen
-        if (pool.isNotEmpty()) return pool.maxBy { it.third }.first
+        return null
+    }
 
+    /**
+     * 悬浮球 / 设置入口没有手指位置：在当前界面可见的画面里，优先正在播放的、面积最大的那块。
+     */
+    private fun selectPlayer(activity: Activity?): Any? {
+        val decor = activity?.window?.decorView
+        if (decor != null) {
+            val onScreen = videoLikeViews(decor).filter { isOnScreen(it) }.mapNotNull { view ->
+                val player = playerForView(view) ?: return@mapNotNull null
+                Triple(player, isPlaying(player), view.width.toLong() * view.height.toLong())
+            }
+            val playingVisible = onScreen.filter { it.second }
+            val pool = playingVisible.ifEmpty { onScreen }
+            if (pool.isNotEmpty()) return pool.maxBy { it.third }.first
+        }
+        val live = synchronized(players) { players.keys.toList() }
         val playing = live.filter { isPlaying(it) }
         if (playing.size == 1) return playing[0]
         val rendered = lastRendered?.get()
         if (rendered != null && rendered in playing) return rendered
-        if (rendered != null && rendered in live) return rendered
-        return playing.lastOrNull()
-    }
-
-    private fun outputView(player: Any): View? {
-        val output = playerToOutput[player]?.get() ?: return null
-        return output as? View
+        return null
     }
 
     private fun hookNamedBuilders(classLoader: ClassLoader) {
@@ -160,41 +138,8 @@ object PlayerPlaybackTracker {
                     })
                 } else {
                     XposedBridge.hookAllConstructors(clazz, attachCtor)
-                    hookConcrete(clazz)
                 }
                 Logger.i("PlayerTracker hooked $name")
-            } catch (_: Throwable) {
-            }
-        }
-    }
-
-    private val discoveredClasses = mutableSetOf<Class<*>>()
-
-    fun installDiscovered(classLoader: ClassLoader) = hookDexKitImpl(classLoader)
-
-    @Synchronized
-    private fun hookDexKitImpl(classLoader: ClassLoader) {
-        val target = DexKitManager.getTarget(DexKitManager.KEY_EXOPLAYER_IMPL, classLoader) ?: return
-        val clazz = target.declaringClass
-        if (clazz in discoveredClasses) return
-        try {
-            XposedBridge.hookAllConstructors(clazz, attachCtor)
-            discoveredClasses.add(clazz)
-            hookConcrete(clazz)
-            Logger.i("PlayerTracker hooked validated DexKit class ${clazz.name}")
-        } catch (t: Throwable) {
-            Logger.w("PlayerTracker DexKit impl hook failed: ${t.message}")
-        }
-    }
-
-    private fun hookExoInterface(classLoader: ClassLoader) {
-        for (name in listOf(
-            "androidx.media3.exoplayer.ExoPlayer",
-            "com.google.android.exoplayer2.ExoPlayer",
-            "androidx.media3.common.Player"
-        )) {
-            try {
-                hookConcrete(classLoader.loadClass(name))
             } catch (_: Throwable) {
             }
         }
@@ -210,14 +155,7 @@ object PlayerPlaybackTracker {
                 val clazz = classLoader.loadClass(name)
                 XposedBridge.hookAllMethods(clazz, "setPlayer", object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        val view = param.thisObject as? View ?: return
-                        val player = param.args.getOrNull(0)
-                        if (player == null) {
-                            unbindOutput(view)
-                        } else {
-                            attach(player)
-                            bindOutput(player, view)
-                        }
+                        attach(param.args.getOrNull(0))
                     }
                 })
                 Logger.i("PlayerTracker hooked $name.setPlayer")
@@ -232,106 +170,46 @@ object PlayerPlaybackTracker {
         }
     }
 
-    private fun hookConcrete(clazz: Class<*>) {
-        if (!hookedClasses.add(clazz.name)) return
-        try {
-            XposedBridge.hookAllMethods(clazz, "setMediaItem", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    attach(param.thisObject)
-                }
-            })
-        } catch (_: Throwable) {
-        }
-        hookVideoOutputs(clazz)
-    }
-
-    private fun hookVideoOutputs(clazz: Class<*>) {
-        val seen = mutableSetOf<Method>()
-        for (method in clazz.methods) {
-            if (method.parameterTypes.size != 1) continue
-            if (!seen.add(method)) continue
-            val n = method.name
-            val arg = method.parameterTypes[0]
-            val isClear = n.contains("clear", ignoreCase = true)
-            val knownSet = n == "setVideoSurface" || n == "setVideoSurfaceView" ||
-                n == "setVideoTextureView" || n == "setVideoSurfaceHolder" ||
-                n == "setVideoOutput"
-            val byType = arg == Surface::class.java ||
-                arg == SurfaceView::class.java ||
-                arg == TextureView::class.java ||
-                SurfaceHolder::class.java.isAssignableFrom(arg)
-            if (!knownSet && !isClear && !byType) continue
-            if (!knownSet && !isClear && n.length > 4 && !n.contains("Video", ignoreCase = true) &&
-                !n.contains("Surface", ignoreCase = true) && !n.contains("Texture", ignoreCase = true)
-            ) {
-                continue
-            }
+    /** 播放器当前持有的输出对象（字段类型为 Surface / SurfaceHolder / SurfaceView / TextureView / Object）。 */
+    private fun currentOutputs(player: Any): List<Any> {
+        val fields = outputFieldCache.getOrPut(player.javaClass) { outputFields(player.javaClass) }
+        return fields.mapNotNull { field ->
             try {
-                XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        val player = param.thisObject
-                        attach(player)
-                        val output = param.args.getOrNull(0)
-                        if (output == null || isClear) {
-                            unbindPlayer(player)
-                        } else {
-                            bindOutput(player, output)
-                        }
-                    }
-                })
+                field.get(player)?.takeIf {
+                    it is Surface || it is SurfaceHolder || it is View
+                }
             } catch (_: Throwable) {
+                null
             }
         }
     }
 
-    private fun bindOutput(player: Any, output: Any) {
-        unbindPlayer(player)
-        playerToOutput[player] = WeakReference(output)
-        for (key in outputKeys(output)) {
-            outputToPlayer[key] = WeakReference(player)
-        }
-        // 子树扩散：X 自研播放器视图树里 SurfaceView 与 PlayerView 可能是兄弟节点，
-        // 只登记自身 key 会导致长按命中的 view 查不到映射、错误回落全局播放器选择。
-        // 扩散到整个子树的 video-like 视图（不覆盖已有映射，兄弟 Surface 属其它 player 时不抢）。
-        if (output is View) {
-            for (child in videoLikeViews(output)) {
-                for (key in outputKeys(child)) {
-                    if (outputToPlayer[key]?.get() == null) {
-                        outputToPlayer[key] = WeakReference(player)
+    private fun outputFields(clazz: Class<*>): List<Field> {
+        val out = mutableListOf<Field>()
+        var c: Class<*>? = clazz
+        while (c != null && c != Any::class.java) {
+            for (field in c.declaredFields) {
+                if (Modifier.isStatic(field.modifiers)) continue
+                val t = field.type
+                if (t == Any::class.java || t == Surface::class.java ||
+                    SurfaceHolder::class.java.isAssignableFrom(t) || View::class.java.isAssignableFrom(t)
+                ) {
+                    try {
+                        field.isAccessible = true
+                        out.add(field)
+                    } catch (_: Throwable) {
                     }
                 }
             }
+            c = c.superclass
         }
+        return out
     }
 
-    private fun unbindPlayer(player: Any) {
-        val old = playerToOutput.remove(player)?.get()
-        if (old != null) {
-            for (key in outputKeys(old)) {
-                val mapped = outputToPlayer[key]?.get()
-                if (mapped === player) outputToPlayer.remove(key)
-            }
-            // 同时清掉该 player 扩散登记的子树 key
-            if (old is View) {
-                for (child in videoLikeViews(old)) {
-                    for (key in outputKeys(child)) {
-                        val mapped = outputToPlayer[key]?.get()
-                        if (mapped === player) outputToPlayer.remove(key)
-                    }
-                }
-            }
-        }
-    }
+    /** 播放器当前输出对应的视图（只有 TextureView / SurfaceView 能直接拿到）。 */
+    private fun outputView(player: Any): View? = currentOutputs(player).firstOrNull { it is View } as? View
 
-    private fun unbindOutput(output: Any) {
-        val player = outputToPlayer[output]?.get()
-        for (key in outputKeys(output)) {
-            outputToPlayer.remove(key)
-        }
-        if (player != null) unbindPlayer(player)
-    }
-
-    /** 收集视图子树中所有 video-like 视图（供绑定扩散与查找）。 */
+    /** 收集视图子树中所有 video-like 视图。 */
     private fun videoLikeViews(root: View): List<View> {
         val out = mutableListOf<View>()
         fun walk(v: View) {
@@ -344,8 +222,8 @@ object PlayerPlaybackTracker {
         return out
     }
 
-    private fun outputKeys(output: Any): List<Any> {
-        val keys = mutableListOf(output)
+    private fun outputKeys(output: View): List<Any> {
+        val keys = mutableListOf<Any>(output)
         try {
             when (output) {
                 is SurfaceView -> {
@@ -354,9 +232,6 @@ object PlayerPlaybackTracker {
                 }
                 is TextureView -> {
                     output.surfaceTexture?.let { keys.add(it) }
-                }
-                is SurfaceHolder -> {
-                    output.surface?.let { keys.add(it) }
                 }
             }
         } catch (_: Throwable) {
@@ -466,38 +341,36 @@ object PlayerPlaybackTracker {
     }
 
     private fun uriFromPlayer(player: Any): String? {
-        val item = try {
-            XposedHelpers.callMethod(player, "getCurrentMediaItem")
+        try {
+            uriFromMediaItem(XposedHelpers.callMethod(player, "getCurrentMediaItem"))?.let { return it }
         } catch (_: Throwable) {
-            try {
-                findGetCurrentMediaItem(player.javaClass)?.invoke(player)
-            } catch (_: Throwable) {
-                null
-            }
-        } ?: return null
-        return uriFromMediaItem(item)
-    }
-
-    private fun findGetCurrentMediaItem(clazz: Class<*>): Method? {
-        clazz.methods.firstOrNull {
-            it.name == "getCurrentMediaItem" && it.parameterTypes.isEmpty()
-        }?.let { return it }
-        return clazz.methods.firstOrNull { m ->
-            m.parameterTypes.isEmpty() &&
-                !Modifier.isStatic(m.modifiers) &&
-                (m.returnType.name.contains("MediaItem") || hasUriConfig(m.returnType))
         }
+        // 混淆后 getCurrentMediaItem 只剩单字母名：按返回类型的结构找（MediaItem.localConfiguration.uri）。
+        for (method in mediaItemGetters(player.javaClass)) {
+            try {
+                uriFromMediaItem(method.invoke(player))?.let { return it }
+            } catch (_: Throwable) {
+            }
+        }
+        return null
     }
 
+    private fun mediaItemGetters(clazz: Class<*>): List<Method> = clazz.methods.filter { m ->
+        m.parameterTypes.isEmpty() && !Modifier.isStatic(m.modifiers) &&
+            (m.returnType.name.contains("MediaItem") || hasUriConfig(m.returnType))
+    }
+
+    /** 类型有一个公开实例字段，其类型又有公开实例字段 Uri —— MediaItem → LocalConfiguration → uri。 */
     private fun hasUriConfig(cls: Class<*>): Boolean {
         return try {
-            cls.declaredFields.any { field ->
-                field.type.declaredFields.any { it.type.name == "android.net.Uri" }
-            }
+            instanceFields(cls).any { field -> instanceFields(field.type).any { it.type.name == "android.net.Uri" } }
         } catch (_: Throwable) {
             false
         }
     }
+
+    private fun instanceFields(cls: Class<*>): List<Field> =
+        cls.fields.filter { !Modifier.isStatic(it.modifiers) }
 
     fun uriFromMediaItem(mediaItem: Any?): String? {
         if (mediaItem == null) return null
@@ -511,9 +384,9 @@ object PlayerPlaybackTracker {
             }
         }
         try {
-            for (field in mediaItem.javaClass.fields) {
+            for (field in instanceFields(mediaItem.javaClass)) {
                 val value = field.get(mediaItem) ?: continue
-                val uriField = value.javaClass.fields.firstOrNull { it.type.name == "android.net.Uri" }
+                val uriField = instanceFields(value.javaClass).firstOrNull { it.type.name == "android.net.Uri" }
                     ?: continue
                 val uri = uriField.get(value)?.toString()
                 if (!uri.isNullOrBlank()) return uri

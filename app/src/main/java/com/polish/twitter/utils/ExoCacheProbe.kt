@@ -16,22 +16,19 @@ object ExoCacheProbe {
 
     private val AUDIO_PLAYLIST = Regex("""/pl/mp4a/(\d+)/[^?\s]+\.m3u8""")
 
-    fun findCurrentHls(context: Context, preferredMediaId: String? = null): ExtractedMedia? {
-        val picked = pickFromKeys(readCacheKeys(context), preferredMediaId) ?: return null
-        Logger.i("ExoCache HLS media=${picked.mediaId} url=${picked.url} audio=${picked.hlsAudioUrl}")
+    fun findCurrentHls(context: Context, mediaId: String): ExtractedMedia? {
+        val picked = pickFromKeys(readCacheKeys(context), mediaId) ?: return null
+        Logger.d("ExoCache HLS media=${picked.mediaId}")
         return picked
     }
 
-    internal fun pickFromKeys(keys: List<String>, preferredMediaId: String? = null): ExtractedMedia? {
-        if (keys.isEmpty()) return null
-        val recentMediaId = keys.asReversed().asSequence().mapNotNull { MediaExtractor.extractMediaId(it) }.firstOrNull()
-        val mediaId = preferredMediaId?.takeIf { it.isNotBlank() } ?: recentMediaId
-        val scoped = if (mediaId != null) {
-            // 已知正在播放的 id 时绝不能 fallback 到其它视频的 cache（上一条仍在缓冲）。
-            keys.filter { MediaExtractor.extractMediaId(it) == mediaId }
-        } else {
-            keys
-        }
+    /**
+     * 只取 [mediaId] 这条视频的缓存。不知道 id 时返回 null：缓存索引按写入顺序排，
+     * 「最后一条」可能是预取的别的视频，也可能是早已删除、播放列表已 404 的旧视频。
+     */
+    internal fun pickFromKeys(keys: List<String>, mediaId: String?): ExtractedMedia? {
+        if (mediaId.isNullOrBlank()) return null
+        val scoped = keys.filter { MediaExtractor.extractMediaId(it) == mediaId }
         if (scoped.isEmpty()) return null
 
         var master: String? = null
@@ -64,7 +61,7 @@ object ExoCacheProbe {
 
         // master 列出全部档位；变体只是播放器当前在拉的那一档（常见 720p）
         val url = master ?: bestVideo ?: return null
-        val id = MediaExtractor.extractMediaId(url) ?: mediaId ?: "hls"
+        val id = MediaExtractor.extractMediaId(url) ?: mediaId
         return ExtractedMedia(
             url = url,
             isVideo = true,
@@ -97,6 +94,7 @@ object ExoCacheProbe {
             }
             val keys = mutableListOf<String>()
             for (table in tables) {
+                if (!DownloadSecurity.isSafeSqlIdentifier(table)) continue
                 db.rawQuery("SELECT key FROM `$table` ORDER BY id ASC", null).use { c ->
                     while (c.moveToNext()) {
                         val key = c.getString(0) ?: continue

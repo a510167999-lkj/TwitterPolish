@@ -9,10 +9,10 @@ android {
 
     defaultConfig {
         applicationId = "com.polish.twitter"
-        minSdk = 26
+        minSdk = 32
         targetSdk = 34
-        versionCode = 10007
-        versionName = "1.0.7"
+        versionCode = 10100
+        versionName = "1.1.0"
 
         ndk {
             abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a"))

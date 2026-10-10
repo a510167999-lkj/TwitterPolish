@@ -1,6 +1,6 @@
 name=TwitterPolish
-version=1.0.7
-versionCode=10007
+version=1.1.0
+versionCode=10100
 author=TwitterPolish
 description=X (Twitter) 净化模块：多版本自适应、去广告、瀑布流纯时间序排列、视频与原图下载
 minApi=82
