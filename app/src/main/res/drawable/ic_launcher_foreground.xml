@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- X (com.twitter.android) launcher foreground. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:scaleX="0.06631"
+        android:scaleY="0.06631"
+        android:translateX="35.26"
+        android:translateY="35.5">
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M565.214,558L345.911,238.107L550.518,0H479.301L314.259,192.117L182.677,0H3.1652L214.555,308.339L0,558H71.217L246.207,354.329L385.928,558H565.44H565.214ZM159.164,44.8575L480.206,513.143H409.215L88.1734,44.8575H159.164Z" />
+    </group>
+</vector>
